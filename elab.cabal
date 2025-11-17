@@ -17,7 +17,6 @@ license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
     README.md
-    CHANGELOG.md
 
 source-repository head
   type: git
@@ -27,6 +26,7 @@ library
   exposed-modules:
       Lib
       Syntax
+      TypeCheck
   other-modules:
       Paths_elab
   autogen-modules:
@@ -34,7 +34,7 @@ library
   hs-source-dirs:
       src
   default-extensions:
-      DeriveGeneric MultiParamTypeClasses LambdaCase
+      DeriveGeneric MultiParamTypeClasses LambdaCase BlockArguments
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
@@ -50,7 +50,7 @@ executable elab-exe
   hs-source-dirs:
       app
   default-extensions:
-      DeriveGeneric MultiParamTypeClasses LambdaCase
+      DeriveGeneric MultiParamTypeClasses LambdaCase BlockArguments
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
@@ -67,7 +67,7 @@ test-suite elab-test
   hs-source-dirs:
       test
   default-extensions:
-      DeriveGeneric MultiParamTypeClasses LambdaCase
+      DeriveGeneric MultiParamTypeClasses LambdaCase BlockArguments
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5

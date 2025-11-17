@@ -1,8 +1,4 @@
-module Syntax (
-  normterm,
-  testterm,
-  nbeterm
-) where
+module Syntax where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
@@ -158,12 +154,22 @@ substnft (El t) = El <$> substnf t
 
 ----- Normalization by Evaluation -----
 type Env = [(Var, Val)]
-data Closure r = Closure Env (Bind r Term)
+data Closure r t = Closure Env (Bind r t) deriving Show
 data Val
   = VVar Var
-  | VApp Val Val | VLam {- unpack -} (Closure Var)
+  | VApp Val Val | VLam (Closure Var Term)
   | VPair Val Val | VFst Val | VSnd Val
-  | VNat Int | VSuc Int Val | VRec (Closure ()) (Closure (Var, Var)) Val
+  | VZero | VSuc Int Val | VRec (Closure () Term) (Closure (Var, Var) Term) Val
+  | VQuote TyVal
+  deriving Show
+
+data TyVal
+  = VSigma TyVal (Closure Var Type)
+  | VPi TyVal (Closure Var Type)
+  | VNat
+  | VUniverse
+  | VEl Val
+  deriving Show
 
 eval :: Env -> Term -> FreshM Val
 eval env = \case
@@ -188,19 +194,16 @@ eval env = \case
     case v of
       VPair _ t2 -> return t2
       _ -> return $ VSnd v
-  Zero -> return $ VNat 0
+  Zero -> return VZero
   Suc t -> do
     v <- eval env t
     case v of
-      VNat k -> return (VNat (k+1))
       VSuc k v' -> return (VSuc (k+1) v')
       _ -> return $ VSuc 1 v
   NatElim z s t -> do
     v <- eval env t
     case v of
-      VNat k -> do
-        vz <- eval env z
-        go k vz
+      VZero -> eval env z
       VSuc k v' -> go k (VRec (Closure env (bind () z)) (Closure env s) v')
       _ -> return $ VRec (Closure env (bind () z)) (Closure env s) v
     where
@@ -208,26 +211,76 @@ eval env = \case
       go k v = do
         v' <- go (k-1) v
         ((n,r), s') <- unbind s
-        eval ((n, VNat k) : (r,v') : env) s'
-  Quote _ -> error ""
-  The _ _ -> error ""
+        eval ((n, VSuc k VZero) : (r,v') : env) s'
+  Quote ty -> VQuote <$> evalTy env ty -- Should I cancel out possible El?
+  The _ tm -> eval env tm
+
+evalTy :: Env -> Type -> FreshM TyVal
+evalTy env = \case
+  Sigma t1 t2 -> do
+    v1 <- evalTy env t1
+    return $ VSigma v1 (Closure env t2)
+  Pi t1 t2 -> do
+    v1 <- evalTy env t1
+    return $ VPi v1 (Closure env t2)
+  Nat -> return VNat
+  Universe -> return VUniverse
+  El t -> do
+    v <- eval env t
+    case v of
+      VQuote ty -> return ty
+      _ -> return $ VEl v
 
 nTimes :: Int -> (a -> a) -> (a -> a)
 nTimes 0 _ = id
 nTimes n f = f . nTimes (n-1) f
 
+($$) :: Alpha p => Closure p Term -> (p -> [(Var, Val)]) -> FreshM (p, Val)
+($$) (Closure env t) r = do
+  (x, s) <- unbind t
+  s' <- eval (r x ++ env) s
+  return (x, s')
+
+($$-) :: Alpha p => Closure p Type -> (p -> [(Var, Val)]) -> FreshM (p, TyVal)
+($$-) (Closure env t) r = do
+  (x, s) <- unbind t
+  s' <- evalTy (r x ++ env) s
+  return (x, s')
+
 quote :: Val -> FreshM Term
 quote (VVar x) = return $ Var x
 quote (VApp v1 v2) = App <$> quote v1 <*> quote v2
-quote (VLam (Closure _ t)) = return (Lam t) -- ?
+quote (VLam c) = do
+  (x, c') <- c $$ \x -> [(x, VVar x)]
+  t <- quote c'
+  return $ Lam (bind x t)
 quote (VPair v1 v2) = Pair <$> quote v1 <*> quote v2
 quote (VFst v) = Fst <$> quote v
 quote (VSnd v) = Snd <$> quote v
-quote (VNat n) = return $ nTimes n Suc Zero
+quote VZero = return Zero
 quote (VSuc k v) = nTimes k Suc <$> quote v
-quote (VRec (Closure _ z) (Closure _ s) v) = do
-  (_, z') <- unbind z
-  NatElim z' s <$> quote v
+quote (VRec cz cs v) = do
+  (_, z) <- cz $$ \() -> []
+  tz <- quote z
+  (p, s) <- cs $$ \(n,r) -> [(n, VVar n), (r, VVar r)]
+  ts <- quote s
+  NatElim tz (bind p ts) <$> quote v
+quote (VQuote ty) = Quote <$> quoteTy ty
+
+quoteTy :: TyVal -> FreshM Type
+quoteTy (VSigma vty c) = do
+  ty <- quoteTy vty
+  (x, c') <- c $$- \x -> [(x, VVar x)]
+  t <- quoteTy c'
+  return $ Sigma ty (bind x t)
+quoteTy (VPi vty c) = do
+  ty <- quoteTy vty
+  (x, c') <- c $$- \x -> [(x, VVar x)]
+  t <- quoteTy c'
+  return $ Pi ty (bind x t)
+quoteTy VNat = return Nat
+quoteTy VUniverse = return Universe
+quoteTy (VEl t) = El <$> quote t
 
 ----- Examples -----
 
@@ -249,11 +302,34 @@ mul = Lam $ bind x $ Lam $ bind y $
     n = s2n "n"
     r = s2n "r"
 
+ack :: Term
+ack = Lam $ bind x $ NatElim
+  (Lam $ bind y $ Suc (Var y)) -- zero
+  (bind (n, r) $ Lam $ bind y $ NatElim
+    (App (Var r) $ Suc Zero)
+    (bind (n', r') $ App (Var r) (Var r'))
+    (Var y)
+  ) -- succ
+  (Var x)
+  where
+    x = s2n "x"
+    y = s2n "y"
+    n = s2n "n"
+    n' = s2n "n'"
+    r = s2n "r"
+    r' = s2n "r'"
+
+two :: Term
+two = Suc (Suc Zero)
+
+three :: Term
+three = Suc (Suc (Suc Zero))
+
 four :: Term
 four = App (App add (Suc (Suc Zero))) (Suc (Suc Zero))
 
 testterm :: Term
-testterm = App (App mul four) four
+testterm = App (App ack three) two
 
 normterm :: Term
 normterm = runFreshM $ substnf testterm
