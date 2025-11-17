@@ -1,4 +1,8 @@
-module Syntax where
+module Syntax (
+  Var, Term(..), Type(..),
+  Env, Closure(..), Val(..), TyVal(..),
+  eval, ($$), ($$-), quote, nf, nfSubst
+) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
@@ -204,6 +208,7 @@ eval env = \case
     v <- eval env t
     case v of
       VZero -> eval env z
+      VSuc k VZero -> go k =<< eval env z
       VSuc k v' -> go k (VRec (Closure env (bind () z)) (Closure env s) v')
       _ -> return $ VRec (Closure env (bind () z)) (Closure env s) v
     where
@@ -212,7 +217,7 @@ eval env = \case
         v' <- go (k-1) v
         ((n,r), s') <- unbind s
         eval ((n, VSuc k VZero) : (r,v') : env) s'
-  Quote ty -> VQuote <$> evalTy env ty -- Should I cancel out possible El?
+  Quote ty -> VQuote <$> evalTy env ty
   The _ tm -> eval env tm
 
 evalTy :: Env -> Type -> FreshM TyVal
@@ -282,57 +287,8 @@ quoteTy VNat = return Nat
 quoteTy VUniverse = return Universe
 quoteTy (VEl t) = El <$> quote t
 
------ Examples -----
+nf :: Env -> Term -> Term
+nf env t = runFreshM $ quote =<< eval env t
 
-add :: Term
-add = Lam $ bind x $ Lam $ bind y $
-  NatElim (Var y) (bind (n , r) $ Suc (Var r)) (Var x)
-  where
-    x = s2n "x"
-    y = s2n "y"
-    n = s2n "n"
-    r = s2n "r"
-
-mul :: Term
-mul = Lam $ bind x $ Lam $ bind y $
-  NatElim Zero (bind (n , r) $ App (App add (Var r)) (Var y)) (Var x)
-  where
-    x = s2n "x"
-    y = s2n "y"
-    n = s2n "n"
-    r = s2n "r"
-
-ack :: Term
-ack = Lam $ bind x $ NatElim
-  (Lam $ bind y $ Suc (Var y)) -- zero
-  (bind (n, r) $ Lam $ bind y $ NatElim
-    (App (Var r) $ Suc Zero)
-    (bind (n', r') $ App (Var r) (Var r'))
-    (Var y)
-  ) -- succ
-  (Var x)
-  where
-    x = s2n "x"
-    y = s2n "y"
-    n = s2n "n"
-    n' = s2n "n'"
-    r = s2n "r"
-    r' = s2n "r'"
-
-two :: Term
-two = Suc (Suc Zero)
-
-three :: Term
-three = Suc (Suc (Suc Zero))
-
-four :: Term
-four = App (App add (Suc (Suc Zero))) (Suc (Suc Zero))
-
-testterm :: Term
-testterm = App (App ack three) two
-
-normterm :: Term
-normterm = runFreshM $ substnf testterm
-
-nbeterm :: Term
-nbeterm = runFreshM $ quote =<< eval [] testterm
+nfSubst :: Term -> Term
+nfSubst = runFreshM . substnf

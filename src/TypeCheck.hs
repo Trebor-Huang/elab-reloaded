@@ -48,7 +48,6 @@ conv (VRec z s n) (VRec z' s' n') = do
   r <- conv n n'
   return (p && q && r)
 
--- vquote
 conv (VQuote ty1) (VQuote ty2) = convTy ty1 ty2
 conv (VQuote ty) tm = convTy ty (VEl tm) -- Is this necessary?
 conv tm (VQuote ty) = convTy ty (VEl tm)

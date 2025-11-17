@@ -50,6 +50,7 @@ executables:
     - -with-rtsopts=-N
     dependencies:
     - elab
+    - unbound-generics >= 0.4.4
 
 tests:
   elab-test:
@@ -61,4 +62,5 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - elab
+    - unbound-generics >= 0.4.4
     - hspec
