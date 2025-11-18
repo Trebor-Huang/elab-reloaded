@@ -293,7 +293,7 @@ quote (VRec cm cz cs v) = do -- TODO should we not normalize the motive?
   tym <- quoteTy m
   (_, z) <- cz $$ \() -> []
   tz <- quote z
-  (p, s) <- cs $$ \(n,r) -> [(n, VVar n), (r, VVar r)]
+  (p, s) <- cs $$ \(k,r) -> [(k, VVar k), (r, VVar r)]
   ts <- quote s
   -- instead of (bind n tym), directly use cm
   NatElim (bind n tym) tz (bind p ts) <$> quote v

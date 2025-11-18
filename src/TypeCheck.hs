@@ -1,4 +1,7 @@
-module TypeCheck where
+module TypeCheck (
+  runTyckM, emptyContext,
+  check, checkTy, infer, conv, convTy
+) where
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -12,6 +15,9 @@ data Context = Context {
   env :: Env,
   vars :: [(RVar, TyVal)]
 }
+
+emptyContext :: Context
+emptyContext = Context [] []
 
 newVar :: RVar -> Var -> TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
@@ -39,11 +45,7 @@ evalTyM ty = do
 type TyckM = ReaderT Context (ExceptT String FreshM)
 instance Tyck TyckM
 runTyckM :: TyckM a -> Either String a
-runTyckM m = runFreshM $ runExceptT $ runReaderT m
-  Context {
-    env = [],
-    vars = []
-  }
+runTyckM m = runFreshM $ runExceptT $ runReaderT m emptyContext
 
 check :: Tyck m => Raw -> TyVal -> m Term
 check (RLam f) (VPi dom cod) = do

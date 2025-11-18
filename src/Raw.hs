@@ -181,7 +181,7 @@ toRaw = runExcept . runFreshMT . go []
     go env (TNode v []) = case lookup v env of
       Just v' -> return $ RVar v'
       Nothing -> throwError $ "Unrecognized identifier: " ++ v
-    go _ r@(TNode v _) = throwError $ "Unrecognized constructor: " ++ show r
+    go _ (TNode v _) = throwError $ "Unrecognized constructor: " ++ show v
 
 parseString :: String -> IO Raw
 parseString src =
