@@ -33,12 +33,18 @@ ghc-options:
 - -Wredundant-constraints
 
 default-extensions:
-  DeriveGeneric MultiParamTypeClasses LambdaCase BlockArguments
+  DeriveGeneric
+  MultiParamTypeClasses
+  LambdaCase
+  BlockArguments
+  FlexibleContexts
+  FlexibleInstances
 
 library:
   source-dirs: src
   dependencies:
     - unbound-generics >= 0.4.4
+    - mtl >= 2.3.0
 
 executables:
   elab-exe:

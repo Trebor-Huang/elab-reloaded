@@ -1,7 +1,7 @@
 module Syntax (
   Var, Term(..), Type(..),
   Env, Closure(..), Val(..), TyVal(..),
-  eval, ($$), ($$-), quote, nf, nfSubst
+  eval, evalTy, ($$), ($$-), quote, quoteTy, nf, nfSubst
 ) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
@@ -73,7 +73,7 @@ data Type -- Note there is no type variables
 
 showTypeM :: Int -> Type -> FreshM ShowS
 showTypeM i = \case
-  Sigma t1 t2 -> do
+  Sigma t1 t2 -> do -- todo simplify when binder not used
     s1 <- showTypeM 0 t1
     (x, t') <- unbind t2
     s2 <- showTypeM 0 t'
@@ -175,7 +175,7 @@ data TyVal
   | VEl Val
   deriving Show
 
-eval :: Env -> Term -> FreshM Val
+eval :: Fresh m => Env -> Term -> m Val
 eval env = \case
   Var x -> return $ fromJust $ lookup x env
   Lam s -> return $ VLam (Closure env s)
@@ -220,7 +220,7 @@ eval env = \case
   Quote ty -> VQuote <$> evalTy env ty
   The _ tm -> eval env tm
 
-evalTy :: Env -> Type -> FreshM TyVal
+evalTy :: Fresh m => Env -> Type -> m TyVal
 evalTy env = \case
   Sigma t1 t2 -> do
     v1 <- evalTy env t1
@@ -240,19 +240,19 @@ nTimes :: Int -> (a -> a) -> (a -> a)
 nTimes 0 _ = id
 nTimes n f = f . nTimes (n-1) f
 
-($$) :: Alpha p => Closure p Term -> (p -> [(Var, Val)]) -> FreshM (p, Val)
+($$) :: (Fresh m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$) (Closure env t) r = do
   (x, s) <- unbind t
   s' <- eval (r x ++ env) s
   return (x, s')
 
-($$-) :: Alpha p => Closure p Type -> (p -> [(Var, Val)]) -> FreshM (p, TyVal)
+($$-) :: (Fresh m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (p, TyVal)
 ($$-) (Closure env t) r = do
   (x, s) <- unbind t
   s' <- evalTy (r x ++ env) s
   return (x, s')
 
-quote :: Val -> FreshM Term
+quote :: Fresh m => Val -> m Term
 quote (VVar x) = return $ Var x
 quote (VApp v1 v2) = App <$> quote v1 <*> quote v2
 quote (VLam c) = do
@@ -272,7 +272,7 @@ quote (VRec cz cs v) = do
   NatElim tz (bind p ts) <$> quote v
 quote (VQuote ty) = Quote <$> quoteTy ty
 
-quoteTy :: TyVal -> FreshM Type
+quoteTy :: Fresh m => TyVal -> m Type
 quoteTy (VSigma vty c) = do
   ty <- quoteTy vty
   (x, c') <- c $$- \x -> [(x, VVar x)]
