@@ -6,6 +6,7 @@ module Syntax (
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
+import Control.Lens (anyOf)
 
 type Var = Name Term
 
@@ -13,7 +14,12 @@ data Term
   = Var Var
   | Lam (Bind Var Term) | App Term Term
   | Pair Term Term | Fst Term | Snd Term
-  | Zero | Suc Term | NatElim Term (Bind (Var, Var) Term) Term
+  | Zero | Suc Term
+  | NatElim
+    {- motive -} (Bind Var Type)
+    {- zero -} Term
+    {- suc -} (Bind (Var, Var) Term)
+    {- arg -} Term
   | Quote Type
   | The Type Term
   deriving (Generic)
@@ -41,15 +47,24 @@ showTermM i = \case
     s <- showTermM 0 t
     return (showString "snd" . showParen True s)
   Zero -> return (showString "0")
-  Suc t -> do
-    s <- showTermM 0 t
-    return (showString "suc" . showParen True s)
-  NatElim z s t -> do
+  Suc t -> case acc 0 (Suc t) of
+    (k, Zero) -> return (shows k)
+    (k, t') -> do
+      s <- showTermM 1 t'
+      return $ showParen (i > 1) $ shows k . showString " + " . s
+    where
+      acc :: Int -> Term -> (Int, Term)
+      acc k (Suc t0) = acc (k+1) t0
+      acc k t0 = (k, t0)
+  NatElim m z s t -> do
+    (n, m') <- unbind m
+    sm <- showTypeM 0 m'
     sz <- showTermM 0 z
     (x, s') <- unbind s
     ss <- showTermM 0 s'
     st <- showTermM 0 t
     return (showString "elim" . showParen True (
+        shows n . showString ". " . sm . showString ", " .
         sz . showString ", " .
         shows x . showString ". " . ss . showString ", " .
         st
@@ -71,21 +86,28 @@ data Type -- Note there is no type variables
   | El Term
   deriving (Generic)
 
+occurs :: Var -> Type -> Bool
+occurs x = anyOf fv (== x)
+
 showTypeM :: Int -> Type -> FreshM ShowS
 showTypeM i = \case
-  Sigma t1 t2 -> do -- todo simplify when binder not used
+  Sigma t1 t2 -> do
     s1 <- showTypeM 0 t1
     (x, t') <- unbind t2
     s2 <- showTypeM 0 t'
     return (showParen (i > 0) $
-      showParen True (shows x . showString " : " . s1) .
+      (if occurs x t' then
+        showParen True (shows x . showString " : " . s1)
+      else s1) .
       showString " × ". s2)
   Pi t1 t2 -> do
     s1 <- showTypeM 0 t1
     (x, t') <- unbind t2
     s2 <- showTypeM 0 t'
     return (showParen (i > 0) $
-      showParen True (shows x . showString " : " . s1) .
+      (if occurs x t' then
+        showParen True (shows x . showString " : " . s1)
+      else s1) .
       showString " → ". s2)
   Nat -> return (showString "Nat")
   Universe -> return (showString "U")
@@ -132,7 +154,7 @@ substnf (Snd t) = do
     _ -> return $ Snd n
 substnf Zero = return Zero
 substnf (Suc t) = Suc <$> substnf t
-substnf (NatElim z s t) = do
+substnf (NatElim m z s t) = do -- we don't deal with the motive
   n <- substnf t
   go n
   where
@@ -141,7 +163,7 @@ substnf (NatElim z s t) = do
     go (Suc n) = do
       res <- go n
       substnf $ instantiate s [n, res]
-    go r = return $ NatElim z s r
+    go r = return $ NatElim m z s r
 substnf (Quote ty) = Quote <$> substnft ty
 substnf (The ty tm) = The <$> substnft ty <*> substnf tm
 
@@ -163,7 +185,8 @@ data Val
   = VVar Var
   | VApp Val Val | VLam (Closure Var Term)
   | VPair Val Val | VFst Val | VSnd Val
-  | VZero | VSuc Int Val | VRec (Closure () Term) (Closure (Var, Var) Term) Val
+  | VZero | VSuc Int Val
+  | VRec (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) Val
   | VQuote TyVal
   deriving Show
 
@@ -204,13 +227,14 @@ eval env = \case
     case v of
       VSuc k v' -> return (VSuc (k+1) v')
       _ -> return $ VSuc 1 v
-  NatElim z s t -> do
+  NatElim m z s t -> do
     v <- eval env t
+    let vrec = VRec (Closure env m) (Closure env (bind () z)) (Closure env s)
     case v of
       VZero -> eval env z
       VSuc k VZero -> go k =<< eval env z
-      VSuc k v' -> go k (VRec (Closure env (bind () z)) (Closure env s) v')
-      _ -> return $ VRec (Closure env (bind () z)) (Closure env s) v
+      VSuc k v' -> go k (vrec v')
+      _ -> return $ vrec v
     where
       go 0 v = return v
       go k v = do
@@ -264,12 +288,15 @@ quote (VFst v) = Fst <$> quote v
 quote (VSnd v) = Snd <$> quote v
 quote VZero = return Zero
 quote (VSuc k v) = nTimes k Suc <$> quote v
-quote (VRec cz cs v) = do
+quote (VRec cm cz cs v) = do -- TODO should we not normalize the motive?
+  (n, m) <- cm $$- \n -> [(n, VVar n)]
+  tym <- quoteTy m
   (_, z) <- cz $$ \() -> []
   tz <- quote z
   (p, s) <- cs $$ \(n,r) -> [(n, VVar n), (r, VVar r)]
   ts <- quote s
-  NatElim tz (bind p ts) <$> quote v
+  -- instead of (bind n tym), directly use cm
+  NatElim (bind n tym) tz (bind p ts) <$> quote v
 quote (VQuote ty) = Quote <$> quoteTy ty
 
 quoteTy :: Fresh m => TyVal -> m Type

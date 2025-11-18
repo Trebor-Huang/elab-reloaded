@@ -3,27 +3,10 @@ import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless
-import GHC.Generics (Generic)
 import Data.Coerce (coerce)
 
 import Syntax
-
--- Raw terms
-type RVar = Name Raw
-data Raw
-  = RVar RVar
-  | RLam (Bind RVar Raw) | RApp Raw Raw | RPi Raw (Bind RVar Raw)
-  | RPair Raw Raw | RFst Raw | RSnd Raw | RSigma Raw (Bind RVar Raw)
-  | RZero | RSuc Raw | RElim Raw (Bind (RVar, RVar) Raw) Raw | RNat
-  | RUniverse -- implicit Coquand universe
-  | RThe Raw Raw
-  deriving (Generic, Show)
-
-instance Alpha Raw
-
-instance Subst Raw Raw where
-  isvar (RVar x) = Just (SubstName x)
-  isvar _ = Nothing
+import Raw
 
 data Context = Context {
   env :: Env,
@@ -36,7 +19,22 @@ newVar vraw var ty ctx = ctx {
   vars = (vraw, ty) : vars ctx
 }
 
+bindEnv :: Var -> Val -> Context -> Context
+bindEnv var val ctx = ctx {
+  env = (var, val) : env ctx
+}
+
 class (MonadError String m, MonadReader Context m, Fresh m) => Tyck m
+
+evalM :: (MonadReader Context m, Fresh m) => Term -> m Val
+evalM tm = do
+  e <- asks env
+  eval e tm
+
+evalTyM :: (MonadReader Context m, Fresh m) => Type -> m TyVal
+evalTyM ty = do
+  e <- asks env
+  evalTy e ty
 
 type TyckM = ReaderT Context (ExceptT String FreshM)
 instance Tyck TyckM
@@ -57,8 +55,7 @@ check (RLam f) (VPi dom cod) = do
 
 check (RPair s1 s2) (VSigma t1 t2) = do
   s1' <- check s1 t1
-  e <- asks env
-  v1 <- eval e s1'
+  v1 <- evalM s1'
   (_, t2') <- t2 $$- \y -> [(y, v1)]
   s2' <- check s2 t2'
   return $ Pair s1' s2'
@@ -77,16 +74,14 @@ check tm ty = do
 checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
 checkTy (RPi rdom rc) = do
   dom <- checkTy rdom
-  e <- asks env
-  vdom <- evalTy e dom
+  vdom <- evalTyM dom
   (x, rcod) <- unbind rc
   let x' = coerce x :: Var
   cod <- local (newVar x x' vdom) $ checkTy rcod
   return (Pi dom (bind x' cod)) -- ?
 checkTy (RSigma rty1 rc) = do
   ty1 <- checkTy rty1
-  e <- asks env
-  vty1 <- evalTy e ty1
+  vty1 <- evalTyM ty1
   (x, rty2) <- unbind rc
   let x' = coerce x :: Var
   ty2 <- local (newVar x x' vty1) $ checkTy rty2
@@ -100,8 +95,7 @@ checkTy rtm = do
 infer :: Tyck m => Raw -> m (Term, TyVal)
 infer (RThe rty rtm) = do
   ty <- checkTy rty
-  e <- asks env
-  vty <- evalTy e ty
+  vty <- evalTyM ty
   tm <- check rtm vty
   return (tm, vty)
 
@@ -109,18 +103,17 @@ infer (RVar x) = do
   vs <- asks vars
   case lookup x vs of
     Just y -> return (Var (coerce x), y)
-    Nothing -> throwError "Variable out of scope: ..."
+    Nothing -> throwError $ "Variable out of scope: " ++ show x
 
 infer (RApp rfun rarg) = do
   (fun, ty) <- infer rfun
   case ty of
     VPi dom cod -> do
       arg <- check rarg dom
-      e <- asks env
-      varg <- eval e arg
+      varg <- evalM arg
       (_, vcod) <- cod $$- \y -> [(y, varg)]
       return (App fun arg, vcod)
-    _ -> throwError "Expected Pi type"
+    _ -> throwError $ "Expected Pi type: " ++ show ty
 infer (RLam _) = throwError "Unable to infer type of lambda"
 infer rty@RPi {} = do
   ty <- checkTy rty
@@ -135,8 +128,7 @@ infer (RSnd r) = do
   (t, ty) <- infer r
   case ty of
     VSigma _ ty2 -> do
-      e <- asks env
-      varg <- eval e (Fst t)
+      varg <- evalM (Fst t)
       (_, sty2) <- ty2 $$- \y -> [(y, varg)]
       return (Snd t, sty2)
     _ -> throwError "Expected Sigma type"
@@ -149,7 +141,27 @@ infer RZero = return (Zero, VNat)
 infer (RSuc r) = do
   t <- check r VNat
   return (Suc t, VNat)
-infer (RElim {}) = throwError "Unable to infer type of eliminators" -- TODO
+infer (RElim rmc rz rsc rarg) = do
+  -- check argument
+  arg <- check rarg VNat
+  -- check motive
+  (n, rm) <- unbind rmc
+  let n' = coerce n :: Var
+  tym <- local (newVar n n' VNat) $ checkTy rm
+  -- check zero argument
+  tym_z <- local (bindEnv n' VZero) $ evalTyM tym
+  tz <- check rz tym_z
+  -- check suc argument
+  ((x, r), rs) <- unbind rsc
+  let x' = coerce x :: Var
+  let r' = coerce r :: Var
+  tyr_s <- local (bindEnv n' (VVar x')) $ evalTyM tym
+  tym_s <- local (bindEnv n' (VSuc 1 (VVar x'))) $ evalTyM tym
+  ts <- local (newVar x x' VNat . newVar r r' tyr_s) $ check rs tym_s
+  -- evaluate the type
+  varg <- evalM arg
+  ty <- local (bindEnv n' varg) $ evalTyM tym
+  return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, ty)
 infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can inline it
 
 infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
@@ -189,7 +201,9 @@ conv (VSnd s) (VSnd t) = conv s t
 
 conv VZero VZero = return True
 conv (VSuc n t) (VSuc m s) = (&&) (n == m) <$> conv t s
-conv (VRec z s n) (VRec z' s' n') = do
+conv (VRec _ z s n) (VRec _ z' s' n') = do
+  -- since we are assuming they have the same type,
+  -- conversion should not depend on the motive
   (_, vz) <- z $$ \() -> []
   (_, vz') <- z' $$ \() -> []
   p <- conv vz vz'
