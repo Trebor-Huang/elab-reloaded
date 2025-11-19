@@ -143,7 +143,7 @@ infer RZero = return (Zero, VNat)
 infer (RSuc r) = do
   t <- check r VNat
   return (Suc t, VNat)
-infer (RElim rmc rz rsc rarg) = do
+infer (RNatElim rmc rz rsc rarg) = do
   -- check argument
   arg <- check rarg VNat
   -- check motive
@@ -203,7 +203,7 @@ conv (VSnd s) (VSnd t) = conv s t
 
 conv VZero VZero = return True
 conv (VSuc n t) (VSuc m s) = (&&) (n == m) <$> conv t s
-conv (VRec _ z s n) (VRec _ z' s' n') = do
+conv (VNatElim _ z s n) (VNatElim _ z' s' n') = do
   -- since we are assuming they have the same type,
   -- conversion should not depend on the motive
   (_, vz) <- z $$ \() -> []

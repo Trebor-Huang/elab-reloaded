@@ -24,7 +24,7 @@ data Raw
   | RLam (Bind RVar Raw) | RApp Raw Raw | RPi Raw (Bind RVar Raw)
   | RPair Raw Raw | RFst Raw | RSnd Raw | RSigma Raw (Bind RVar Raw)
   | RZero | RSuc Raw
-  | RElim
+  | RNatElim
     {- motive -} (Bind RVar Raw)
     {- zero -} Raw
     {- suc -} (Bind (RVar, RVar) Raw)
@@ -180,7 +180,7 @@ toRaw = runExcept . runFreshMT . go []
       vr <- fresh (s2n r)
       rs <- go (pushVar x vx $ pushVar r vr env) s
       rn <- go env n
-      return $ RElim (bind vy rm) rz (bind (vx, vr) rs) rn
+      return $ RNatElim (bind vy rm) rz (bind (vx, vr) rs) rn
 
     go _ (TNode "U" []) = return RUniverse
 

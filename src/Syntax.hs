@@ -180,6 +180,9 @@ substnft Nat = return Nat
 substnft Universe = return Universe
 substnft (El t) = El <$> substnf t
 
+nfSubst :: Term -> Term
+nfSubst = runFreshM . substnf
+
 ----- Normalization by Evaluation -----
 type Env = [(Var, Val)]
 data Closure r t = Closure Env (Bind r t) deriving Show
@@ -188,7 +191,7 @@ data Val
   | VApp Val Val | VLam (Closure Var Term)
   | VPair Val Val | VFst Val | VSnd Val
   | VZero | VSuc Int Val
-  | VRec (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) Val
+  | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) Val
   | VQuote TyVal
   deriving Show
 
@@ -231,7 +234,7 @@ eval env = \case
       _ -> return $ VSuc 1 v
   NatElim m z s t -> do
     v <- eval env t
-    let vrec = VRec (Closure env m) (Closure env (bind () z)) (Closure env s)
+    let vrec = VNatElim (Closure env m) (Closure env (bind () z)) (Closure env s)
     case v of
       VZero -> eval env z
       VSuc k VZero -> go k =<< eval env z
@@ -286,7 +289,7 @@ quote (VFst v) = Fst <$> quote v
 quote (VSnd v) = Snd <$> quote v
 quote VZero = return Zero
 quote (VSuc k v) = nTimes k Suc <$> quote v
-quote (VRec cm cz cs v) = do -- TODO should we not normalize the motive?
+quote (VNatElim cm cz cs v) = do -- TODO should we not normalize the motive?
   (n, m) <- cm $$- \n -> [(n, VVar n)]
   tym <- quoteTy m
   (_, z) <- cz $$ \() -> []
@@ -314,6 +317,3 @@ quoteTy (VEl t) = El <$> quote t
 
 nf :: Env -> Term -> Term
 nf env t = runFreshM $ quote =<< eval env t
-
-nfSubst :: Term -> Term
-nfSubst = runFreshM . substnf
