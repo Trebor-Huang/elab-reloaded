@@ -28,6 +28,7 @@ library
       Raw
       Syntax
       TypeCheck
+      Utils
   other-modules:
       Paths_elab
   autogen-modules:

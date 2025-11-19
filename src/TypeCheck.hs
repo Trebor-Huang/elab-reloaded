@@ -99,7 +99,7 @@ infer (RThe rty rtm) = do
   ty <- checkTy rty
   vty <- evalTyM ty
   tm <- check rtm vty
-  return (tm, vty)
+  return (The ty tm, vty)
 
 infer (RVar x) = do
   vs <- asks vars

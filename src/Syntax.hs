@@ -8,6 +8,8 @@ import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
 import Control.Lens (anyOf)
 
+import Utils
+
 type Var = Name Term
 
 data Term
@@ -165,7 +167,7 @@ substnf (NatElim m z s t) = do -- we don't deal with the motive
       substnf $ instantiate s [n, res]
     go r = return $ NatElim m z s r
 substnf (Quote ty) = Quote <$> substnft ty
-substnf (The ty tm) = The <$> substnft ty <*> substnf tm
+substnf (The _ tm) = substnf tm
 
 substnft :: Type -> FreshM Type
 substnft (Sigma t1 t2) = do
@@ -259,10 +261,6 @@ evalTy env = \case
     case v of
       VQuote ty -> return ty
       _ -> return $ VEl v
-
-nTimes :: Int -> (a -> a) -> (a -> a)
-nTimes 0 _ = id
-nTimes n f = f . nTimes (n-1) f
 
 ($$) :: (Fresh m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$) (Closure env t) r = do

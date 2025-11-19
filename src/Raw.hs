@@ -11,8 +11,11 @@ import qualified Data.Char as C
 import qualified Text.Megaparsec.Char.Lexer as L
 import GHC.Generics (Generic)
 import Data.Void (Void)
+import Control.Monad
 import Control.Monad.Except
 import System.Exit (exitSuccess)
+
+import Utils
 
 -- Raw terms
 type RVar = Name Raw
@@ -44,6 +47,7 @@ type Identifier = String
 data ParseTree
   = TNode Identifier [([Identifier], ParseTree)]
   | TApp ParseTree ParseTree
+  | TInt Integer
   deriving Show
 
 spaceEater :: Parser ()
@@ -70,12 +74,15 @@ pArrowTimes = (True <$ pArrow) <|> (False <$ pTimes)
 
 pIdent :: Parser String
 pIdent = try (do
-  x <- takeWhile1P Nothing (\x -> C.isAlphaNum x && (x /= 'λ'))
-  -- guard $ notElem x [...]
-  x <$ spaceEater) <?> "identifier"
+  x0 <- C.letterChar
+  guard $ x0 /= 'λ'
+  x <- takeWhileP Nothing (\x -> C.isAlphaNum x || (x == '\''))
+  -- guard $ notElem (x0:x) [] -- keywords
+  (x0:x) <$ spaceEater) <?> "identifier"
 
 pAtom :: Parser ParseTree
 pAtom = choice [
+    TInt <$> lexeme L.decimal,
     try pCons,
     (`TNode` []) <$> pIdent,
     parens pRaw
@@ -163,6 +170,7 @@ toRaw = runExcept . runFreshMT . go []
 
     go _ (TNode "zero" []) = return RZero
     go env (TNode "suc" [([], p)]) = RSuc <$> go env p
+    go _ (TInt k) = return $ nTimes k RSuc RZero
     go _ (TNode "Nat" []) = return RNat
     go env (TNode "elim" [([y], m), ([], z), ([x, r], s), ([], n)]) = do
       vy <- fresh (s2n y)
