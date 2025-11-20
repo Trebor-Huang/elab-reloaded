@@ -29,11 +29,10 @@ data Term
   | The Type Term
   deriving (Generic)
 
-showTermM :: Int -> Term -> FreshM ShowS
+showTermM :: Int -> Term -> LFreshM ShowS
 showTermM i = \case
   Var x -> return (showsPrec i x)
-  Lam t -> do
-    (x, t') <- unbind t
+  Lam t -> lunbind t \(x, t') -> do
     s <- showTermM 0 t'
     return (showParen (i > 0) $
       showString "λ" . shows x . showString ". " . s)
@@ -62,18 +61,16 @@ showTermM i = \case
       acc k (Suc t0) = acc (k+1) t0
       acc k t0 = (k, t0)
   NatElim m z s t -> do
-    (n, m') <- unbind m
-    sm <- showTypeM 0 m'
+    sm <- lunbind m \(n, m') -> do
+      sm <- showTypeM 0 m'
+      return $ shows n . showString ". " . sm . showString ", "
     sz <- showTermM 0 z
-    (x, s') <- unbind s
-    ss <- showTermM 0 s'
+    ss <- lunbind s \(x, s') -> do
+      ss <- showTermM 0 s'
+      return $ shows x . showString ". " . ss . showString ", "
     st <- showTermM 0 t
-    return (showString "elim" . showParen True (
-        shows n . showString ". " . sm . showString ", " .
-        sz . showString ", " .
-        shows x . showString ". " . ss . showString ", " .
-        st
-      ))
+    return $ showString "elim" .
+      showParen True (sm . sz . showString ", " . ss . st)
   Quote t -> showTypeM i t
   The ty tm -> do
     sty <- showTypeM 1 ty
@@ -81,7 +78,7 @@ showTermM i = \case
     return (showParen (i > 0) $ stm . showString " : " . sty)
 
 instance Show Term where
-  showsPrec i t = runFreshM (showTermM i t)
+  showsPrec i t = runLFreshM (showTermM i t)
 
 data Type -- Note there is no type variables
   = Sigma Type (Bind Var Type)
@@ -94,26 +91,26 @@ data Type -- Note there is no type variables
 occurs :: Var -> Type -> Bool
 occurs x = anyOf fv (== x)
 
-showTypeM :: Int -> Type -> FreshM ShowS
+showTypeM :: Int -> Type -> LFreshM ShowS
 showTypeM i = \case
   Sigma t1 t2 -> do
     s1 <- showTypeM 0 t1
-    (x, t') <- unbind t2
-    s2 <- showTypeM 0 t'
-    return (showParen (i > 0) $
-      (if occurs x t' then
-        showParen True (shows x . showString " : " . s1)
-      else s1) .
-      showString " × ". s2)
+    lunbind t2 \(x, t') -> do
+      s2 <- showTypeM 0 t'
+      return (showParen (i > 0) $
+        (if occurs x t' then
+          showParen True (shows x . showString " : " . s1)
+        else s1) .
+        showString " × " . s2)
   Pi t1 t2 -> do
     s1 <- showTypeM 0 t1
-    (x, t') <- unbind t2
-    s2 <- showTypeM 0 t'
-    return (showParen (i > 0) $
-      (if occurs x t' then
-        showParen True (shows x . showString " : " . s1)
-      else s1) .
-      showString " → ". s2)
+    lunbind t2 \(x, t') -> do
+      s2 <- showTypeM 0 t'
+      return (showParen (i > 0) $
+        (if occurs x t' then
+          showParen True (shows x . showString " : " . s1)
+        else s1) .
+        showString " → " . s2)
   Nat -> return (showString "Nat")
   Universe -> return (showString "U")
   El t -> do
@@ -122,7 +119,7 @@ showTypeM i = \case
 
 
 instance Show Type where
-  showsPrec i t = runFreshM (showTypeM i t)
+  showsPrec i t = runLFreshM (showTypeM i t)
 
 instance Alpha Term
 instance Alpha Type

@@ -94,6 +94,7 @@ pBinder = pIdent <|> symbol "_"
 pBinders :: Parser ([Identifier], ParseTree)
 pBinders = do
   xs <- some pBinder
+  -- todo for any repeat, replace the earlier ones with _ (or unreachable variants of it)
   char '.'
   t <- pRaw
   return (xs, t)

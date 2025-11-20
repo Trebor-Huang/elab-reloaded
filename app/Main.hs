@@ -37,9 +37,9 @@ ack = Lam $ bind x $ NatElim
 acks :: String
 acks = unlines [
     "λx. elim(_. Nat -> Nat,",
-    "{- zero -}     λy. suc(y),",
-    "{- suc -} n r. λy.",
-      "elim(_. Nat, r suc(zero), m s. r s, y),",
+    "{- zero -}     λx. suc(x),",
+    "{- suc -} x r. λx.",
+      "elim(_. Nat, r suc(zero), m s. r s, x),",
     "x)"
   ]
 
