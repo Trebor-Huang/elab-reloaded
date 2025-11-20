@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -Wno-name-shadowing #-}
 module TypeCheck (
   runTyckM, emptyContext,
   check, checkTy, infer, conv, convTy
@@ -10,6 +11,7 @@ import Data.Coerce (coerce)
 
 import Syntax
 import Raw
+import Utils
 
 data Context = Context {
   env :: Env,
@@ -169,7 +171,26 @@ infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can in
 infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
 
 conv :: (Fresh m) => Val -> Val -> m Bool
-conv (VVar x) (VVar y) = return (x == y)
+conv (VNeutral v sp) (VNeutral v' sp') | v == v' = go sp sp'
+  where
+    go [] [] = return True
+    go (s:sp) (s':sp') = go sp sp' &&? case (s, s') of
+      (VApp s, VApp s') -> conv s s'
+      (VFst, VFst) -> return True
+      (VSnd, VSnd) -> return True
+      (VNatElim _ z s, VNatElim _ z' s') ->
+        -- since we are assuming they have the same type,
+        -- conversion should not depend on the motive
+        (do
+          (_, vz) <- z $$ \() -> []
+          (_, vz') <- z' $$ \() -> []
+          conv vz vz')
+        &&? (do
+          ((m, k), vs) <- s $$ \(m, k) -> [(m, VVar m), (k, VVar k)]
+          (_, vs') <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
+          conv vs vs')
+      _ -> return False
+    go _ _ = return False
 
 conv (VLam f) (VLam g) = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
@@ -177,43 +198,19 @@ conv (VLam f) (VLam g) = do
   conv s t
 conv (VLam f) g = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
-  conv s (VApp g (VVar x))
+  t <- vApp g (VVar x)
+  conv s t
 conv g (VLam f) = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
-  conv s (VApp g (VVar x))
-conv (VApp s1 t1) (VApp s2 t2) = do
-  p <- conv s1 s2
-  q <- conv t1 t2
-  return (p && q)
+  t <- vApp g (VVar x)
+  conv s t
 
-conv (VPair s1 t1) (VPair s2 t2) = do
-  p <- conv s1 s2
-  q <- conv t1 t2
-  return (p && q)
-conv (VPair s t) m = do
-  p <- conv s (VFst m)
-  q <- conv t (VSnd m)
-  return (p && q)
-conv m (VPair s t) = do
-  p <- conv s (VFst m)
-  q <- conv t (VSnd m)
-  return (p && q)
-conv (VFst s) (VFst t) = conv s t
-conv (VSnd s) (VSnd t) = conv s t
+conv (VPair s1 t1) (VPair s2 t2) = conv s1 s2 &&? conv t1 t2
+conv (VPair s t) m = conv s (vFst m) &&? conv t (vSnd m)
+conv m (VPair s t) = conv s (vFst m) &&? conv t (vSnd m)
 
 conv VZero VZero = return True
-conv (VSuc n t) (VSuc m s) = (&&) (n == m) <$> conv t s
-conv (VNatElim _ z s n) (VNatElim _ z' s' n') = do
-  -- since we are assuming they have the same type,
-  -- conversion should not depend on the motive
-  (_, vz) <- z $$ \() -> []
-  (_, vz') <- z' $$ \() -> []
-  p <- conv vz vz'
-  ((m, k), vs) <- s $$ \(m, k) -> [(m, VVar m), (k, VVar k)]
-  (_, vs') <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
-  q <- conv vs vs'
-  r <- conv n n'
-  return (p && q && r)
+conv (VSuc n t) (VSuc m s) = return (n == m) &&? conv t s
 
 conv (VQuote ty1) (VQuote ty2) = convTy ty1 ty2
 conv (VQuote ty) tm = convTy ty (VEl tm) -- Is this necessary?
@@ -222,18 +219,14 @@ conv tm (VQuote ty) = convTy ty (VEl tm)
 conv _ _ = return False
 
 convTy :: Fresh m => TyVal -> TyVal -> m Bool
-convTy (VSigma ty c) (VSigma ty' c') = do
-  p <- convTy ty ty'
+convTy (VSigma ty c) (VSigma ty' c') = convTy ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
-  q <- convTy s t
-  return (p && q)
-convTy (VPi ty c) (VPi ty' c') = do
-  p <- convTy ty ty'
+  convTy s t
+convTy (VPi ty c) (VPi ty' c') = convTy ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
-  q <- convTy s t
-  return (p && q)
+  convTy s t
 convTy VNat VNat = return True
 convTy VUniverse VUniverse = return True
 convTy (VEl t1) (VEl t2) = conv t1 t2

@@ -1,11 +1,14 @@
 module Syntax (
   Var, Term(..), Type(..),
-  Env, Closure(..), Val(..), TyVal(..),
+  Env, Closure(..), Spine(..),
+  Val(.., VVar), vApp, vFst, vSnd, vSuc, vNatElim,
+  TyVal(..),
   eval, evalTy, ($$), ($$-), quote, quoteTy, nf, nfSubst
 ) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
+import Data.Foldable (foldrM)
 import Control.Lens (anyOf)
 
 import Utils
@@ -186,12 +189,19 @@ nfSubst = runFreshM . substnf
 ----- Normalization by Evaluation -----
 type Env = [(Var, Val)]
 data Closure r t = Closure Env (Bind r t) deriving Show
+
+data Spine
+  = VApp {- -} Val
+  | VFst {- -} | VSnd {- -}
+  | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) {- -}
+  deriving Show
+-- There should be a TySpine in principle but it's just VEl by itself...
+
 data Val
-  = VVar Var
-  | VApp Val Val | VLam (Closure Var Term)
-  | VPair Val Val | VFst Val | VSnd Val
+  = VNeutral Var [Spine]
+  | VLam (Closure Var Term)
+  | VPair Val Val
   | VZero | VSuc Int Val
-  | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) Val
   | VQuote TyVal
   deriving Show
 
@@ -203,6 +213,46 @@ data TyVal
   | VEl Val
   deriving Show
 
+pattern VVar :: Var -> Val
+pattern VVar x = VNeutral x []
+
+vApp :: Fresh m => Val -> Val -> m Val
+vApp t u = case t of
+  VLam t' -> snd <$> t' $$ \x -> [(x, u)]
+  VNeutral v sp -> return $ VNeutral v (VApp u : sp)
+  _ -> error "Impossible"
+
+vFst, vSnd, vSuc :: Val -> Val
+vFst (VPair t _) = t
+vFst (VNeutral v sp) = VNeutral v (VFst:sp)
+vFst _ = error "Impossible"
+
+vSnd (VPair _ t) = t
+vSnd (VNeutral v sp) = VNeutral v (VSnd:sp)
+vSnd _ = error "Impossible"
+
+vSuc (VSuc k v') = VSuc (k+1) v'
+vSuc v = VSuc 1 v
+
+vNatElim :: Fresh m
+  => Closure Var Type
+  -> Closure () Term
+  -> Closure (Var, Var) Term
+  -> Val -> m Val
+vNatElim m z s = \case
+  VZero -> snd <$> z $$ \() -> []
+  VSuc _ (VSuc _ _) -> error "Internal error: stacked VSuc"
+  VSuc k v -> do
+    vrec <- vNatElim m z s v
+    go k vrec
+  VNeutral v sp -> return $ VNeutral v (VNatElim m z s : sp)
+  _ -> error "Impossible"
+  where
+    go 0 v = return v
+    go k v = do
+      v' <- go (k-1) v
+      snd <$> s $$ \(n,r) -> [(n, VSuc k VZero), (r, v')]
+
 eval :: Fresh m => Env -> Term -> m Val
 eval env = \case
   Var x -> return $ fromJust $ lookup x env
@@ -210,42 +260,15 @@ eval env = \case
   App t1 t2 -> do
     v1 <- eval env t1
     v2 <- eval env t2
-    case v1 of
-      VLam (Closure env' t) -> do
-        (x, s) <- unbind t
-        eval ((x,v2):env') s
-      _ -> return $ VApp v1 v2
+    vApp v1 v2
   Pair t1 t2 -> VPair <$> eval env t1 <*> eval env t2
-  Fst t -> do
-    v <- eval env t
-    case v of
-      VPair t1 _ -> return t1
-      _ -> return $ VFst v
-  Snd t -> do
-    v <- eval env t
-    case v of
-      VPair _ t2 -> return t2
-      _ -> return $ VSnd v
+  Fst t -> vFst <$> eval env t
+  Snd t -> vSnd <$> eval env t
   Zero -> return VZero
-  Suc t -> do
-    v <- eval env t
-    case v of
-      VSuc k v' -> return (VSuc (k+1) v')
-      _ -> return $ VSuc 1 v
+  Suc t -> vSuc <$> eval env t
   NatElim m z s t -> do
     v <- eval env t
-    let vrec = VNatElim (Closure env m) (Closure env (bind () z)) (Closure env s)
-    case v of
-      VZero -> eval env z
-      VSuc k VZero -> go k =<< eval env z
-      VSuc k v' -> go k (vrec v')
-      _ -> return $ vrec v
-    where
-      go 0 v = return v
-      go k v = do
-        v' <- go (k-1) v
-        ((n,r), s') <- unbind s
-        eval ((n, VSuc k VZero) : (r,v') : env) s'
+    vNatElim (Closure env m) (Closure env (bind () z)) (Closure env s) v
   Quote ty -> VQuote <$> evalTy env ty
   The _ tm -> eval env tm
 
@@ -278,26 +301,31 @@ evalTy env = \case
   return (x, s')
 
 quote :: Fresh m => Val -> m Term
-quote (VVar x) = return $ Var x
-quote (VApp v1 v2) = App <$> quote v1 <*> quote v2
+quote (VNeutral v sp) = foldrM go (Var v) sp
+  where
+    go s val = case s of
+      VApp arg -> App val <$> quote arg
+      VFst -> return $ Fst val
+      VSnd -> return $ Snd val
+      VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
+        (n, vm) <- cm $$- \n -> [(n, VVar n)]
+        tym <- quoteTy vm
+        (_, vz) <- cz $$ \() -> []
+        tz <- quote vz
+        (p, vs) <- cs $$ \(k,r) -> [(k, VVar k), (r, VVar r)]
+        ts <- quote vs
+        -- instead of (bind n tym), directly use cm
+        return $ NatElim (bind n tym) tz (bind p ts) val
+
 quote (VLam c) = do
   (x, c') <- c $$ \x -> [(x, VVar x)]
   t <- quote c'
   return $ Lam (bind x t)
 quote (VPair v1 v2) = Pair <$> quote v1 <*> quote v2
-quote (VFst v) = Fst <$> quote v
-quote (VSnd v) = Snd <$> quote v
+
 quote VZero = return Zero
 quote (VSuc k v) = nTimes k Suc <$> quote v
-quote (VNatElim cm cz cs v) = do -- TODO should we not normalize the motive?
-  (n, m) <- cm $$- \n -> [(n, VVar n)]
-  tym <- quoteTy m
-  (_, z) <- cz $$ \() -> []
-  tz <- quote z
-  (p, s) <- cs $$ \(k,r) -> [(k, VVar k), (r, VVar r)]
-  ts <- quote s
-  -- instead of (bind n tym), directly use cm
-  NatElim (bind n tym) tz (bind p ts) <$> quote v
+
 quote (VQuote ty) = Quote <$> quoteTy ty
 
 quoteTy :: Fresh m => TyVal -> m Type
