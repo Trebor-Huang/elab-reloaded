@@ -14,14 +14,14 @@ import Raw
 import Utils
 
 data Context = Context {
-  env :: Env,
-  vars :: [(RVar, TyVal)]
+  env :: Env,  -- environment for evaluation  -- TODO should this be Thunked?
+  vars :: [(RVar, Thunk TyVal)]  -- types of raw variables
 }
 
 emptyContext :: Context
 emptyContext = Context [] []
 
-newVar :: RVar -> Var -> TyVal -> Context -> Context
+newVar :: RVar -> Var -> Thunk TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
   env = (var, VVar var) : env ctx,
   vars = (vraw, ty) : vars ctx
@@ -50,14 +50,15 @@ runTyckM :: TyckM a -> Either String a
 runTyckM m = runFreshM $ runExceptT $ runReaderT m emptyContext
 
 check :: Tyck m => Raw -> TyVal -> m Term
-check (RLam f) (VPi dom cod) = do
+check (RLam f) (VPi thdom cod) = do
   (x, t) <- unbind f
   let x' = coerce x :: Var
   (_, ty) <- cod $$- \y -> [(y, VVar x')]
-  t' <- local (newVar x x' dom) $ check t ty
+  t' <- local (newVar x x' thdom) $ check t ty
   return $ Lam $ bind x' t'
 
-check (RPair s1 s2) (VSigma t1 t2) = do
+check (RPair s1 s2) (VSigma th1 t2) = do
+  t1 <- force th1
   s1' <- check s1 t1
   v1 <- evalM s1'
   (_, t2') <- t2 $$- \y -> [(y, v1)]
@@ -69,7 +70,8 @@ check RZero VNat = return Zero
 check (RSuc t) VNat = Suc <$> check t VNat
 
 check tm ty = do
-  (tm', ty') <- infer tm
+  (tm', thty') <- infer tm
+  ty' <- force thty'
   p <- convTy ty ty'
   unless p do
     throwError "Expected ..."
@@ -78,14 +80,14 @@ check tm ty = do
 checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
 checkTy (RPi rdom rc) = do
   dom <- checkTy rdom
-  vdom <- evalTyM dom
+  vdom <- Thunk <$> evalTyM dom
   (x, rcod) <- unbind rc
   let x' = coerce x :: Var
   cod <- local (newVar x x' vdom) $ checkTy rcod
   return (Pi dom (bind x' cod)) -- ?
 checkTy (RSigma rty1 rc) = do
   ty1 <- checkTy rty1
-  vty1 <- evalTyM ty1
+  vty1 <- Thunk <$> evalTyM ty1
   (x, rty2) <- unbind rc
   let x' = coerce x :: Var
   ty2 <- local (newVar x x' vty1) $ checkTy rty2
@@ -96,12 +98,12 @@ checkTy rtm = do
   tm' <- check rtm VUniverse
   return (El tm')
 
-infer :: Tyck m => Raw -> m (Term, TyVal)
+infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
 infer (RThe rty rtm) = do
   ty <- checkTy rty
   vty <- evalTyM ty
   tm <- check rtm vty
-  return (The ty tm, vty)
+  return (The ty tm, Thunk vty)
 
 infer (RVar x) = do
   vs <- asks vars
@@ -110,48 +112,52 @@ infer (RVar x) = do
     Nothing -> throwError $ "Variable out of scope: " ++ show x
 
 infer (RApp rfun rarg) = do
-  (fun, ty) <- infer rfun
+  (fun, thty) <- infer rfun
+  ty <- force thty
   case ty of
-    VPi dom cod -> do
+    VPi thdom cod -> do
+      dom <- force thdom
       arg <- check rarg dom
       varg <- evalM arg
       (_, vcod) <- cod $$- \y -> [(y, varg)]
-      return (App fun arg, vcod)
+      return (App fun arg, Thunk vcod)
     _ -> throwError $ "Expected Pi type: " ++ show ty
 infer (RLam _) = throwError "Unable to infer type of lambda"
 infer rty@RPi {} = do
   ty <- checkTy rty
-  return (Quote ty, VUniverse)
+  return (Quote ty, Thunk VUniverse)
 
 infer (RFst r) = do
-  (t, ty) <- infer r
+  (t, thty) <- infer r
+  ty <- force thty
   case ty of
     VSigma ty1 _ -> return (Fst t, ty1)
     _ -> throwError "Expected Sigma type"
 infer (RSnd r) = do
-  (t, ty) <- infer r
+  (t, thty) <- infer r
+  ty <- force thty
   case ty of
     VSigma _ ty2 -> do
       varg <- evalM (Fst t)
       (_, sty2) <- ty2 $$- \y -> [(y, varg)]
-      return (Snd t, sty2)
+      return (Snd t, Thunk sty2)
     _ -> throwError "Expected Sigma type"
 infer (RPair _ _) = throwError "Unable to infer type of pairs"
 infer rty@RSigma {} = do
   ty <- checkTy rty
-  return (Quote ty, VUniverse)
+  return (Quote ty, Thunk VUniverse)
 
-infer RZero = return (Zero, VNat)
+infer RZero = return (Zero, Thunk VNat)
 infer (RSuc r) = do
   t <- check r VNat
-  return (Suc t, VNat)
+  return (Suc t, Thunk VNat)
 infer (RNatElim rmc rz rsc rarg) = do
   -- check argument
   arg <- check rarg VNat
   -- check motive
   (n, rm) <- unbind rmc
   let n' = coerce n :: Var
-  tym <- local (newVar n n' VNat) $ checkTy rm
+  tym <- local (newVar n n' (Thunk VNat)) $ checkTy rm
   -- check zero argument
   tym_z <- local (bindEnv n' VZero) $ evalTyM tym
   tz <- check rz tym_z
@@ -160,22 +166,23 @@ infer (RNatElim rmc rz rsc rarg) = do
   let x' = coerce x :: Var
   let r' = coerce r :: Var
   tyr_s <- local (bindEnv n' (VVar x')) $ evalTyM tym
-  tym_s <- local (bindEnv n' (VSuc 1 (VVar x'))) $ evalTyM tym
-  ts <- local (newVar x x' VNat . newVar r r' tyr_s) $ check rs tym_s
+  tym_s <- local (bindEnv n' (VSuc 1 (Thunk (VVar x')))) $ evalTyM tym
+  ts <- local (newVar x x' (Thunk VNat) . newVar r r' (Thunk tyr_s))
+    $ check rs tym_s
   -- evaluate the type
   varg <- evalM arg
   ty <- local (bindEnv n' varg) $ evalTyM tym
-  return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, ty)
-infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can inline it
+  return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, Thunk ty)
+infer RNat = return (Quote Nat, Thunk VUniverse) -- since it's just one step we can inline it
 
-infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
+infer RUniverse = return (Quote Universe, Thunk VUniverse) -- todo add universe constraint (i.e. don't inline this)
 
 conv :: (Fresh m) => Val -> Val -> m Bool
 conv (VNeutral v sp) (VNeutral v' sp') | v == v' = go sp sp'
   where
     go [] [] = return True
     go (s:sp) (s':sp') = go sp sp' &&? case (s, s') of
-      (VApp s, VApp s') -> conv s s'
+      (VApp s, VApp s') -> conv' s s'
       (VFst, VFst) -> return True
       (VSnd, VSnd) -> return True
       (VNatElim _ z s, VNatElim _ z' s') ->
@@ -194,40 +201,57 @@ conv (VNeutral v sp) (VNeutral v' sp') | v == v' = go sp sp'
 
 conv (VLam f) (VLam g) = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
-  (_, t) <- g $$ \y -> [(y, VVar x)] -- ???
-  conv s t
+  (_, t) <- g $$ \y -> [(y, VVar x)]
+  -- TODO abstract this pattern and avoid having ($$) leak its variables
+  conv' (Thunk s) (Thunk t)
 conv (VLam f) g = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
-  conv s t
+  conv' (Thunk s) (Thunk t)
 conv g (VLam f) = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
-  conv s t
+  conv' (Thunk s) (Thunk t)
 
-conv (VPair s1 t1) (VPair s2 t2) = conv s1 s2 &&? conv t1 t2
-conv (VPair s t) m = conv s (vFst m) &&? conv t (vSnd m)
-conv m (VPair s t) = conv s (vFst m) &&? conv t (vSnd m)
+conv (VPair s1 t1) (VPair s2 t2) = conv' s1 s2 &&? conv' t1 t2
+conv (VPair s t) m = conv' s (Thunk (vFst m)) &&? conv' t (Thunk (vSnd m))
+conv m (VPair s t) = conv' s (Thunk (vFst m)) &&? conv' t (Thunk (vSnd m))
 
 conv VZero VZero = return True
-conv (VSuc n t) (VSuc m s) = return (n == m) &&? conv t s
+conv (VSuc n t) (VSuc m s) = return (n == m) &&? conv' t s
 
-conv (VQuote ty1) (VQuote ty2) = convTy ty1 ty2
-conv (VQuote ty) tm = convTy ty (VEl tm) -- Is this necessary?
-conv tm (VQuote ty) = convTy ty (VEl tm)
+conv (VQuote ty1) (VQuote ty2) = convTy' ty1 ty2
+conv (VQuote thty) tm = do -- Is this necessary?
+  ty <- force thty
+  convTy ty (VEl (Thunk tm))
+conv tm (VQuote thty) = do
+  ty <- force thty
+  convTy ty (VEl (Thunk tm))
 
 conv _ _ = return False
 
+conv' :: (Fresh m) => Thunk Val -> Thunk Val -> m Bool
+conv' th1 th2 = do
+  v1 <- force th1
+  v2 <- force th2
+  conv v1 v2
+
 convTy :: Fresh m => TyVal -> TyVal -> m Bool
-convTy (VSigma ty c) (VSigma ty' c') = convTy ty ty' &&? do
+convTy (VSigma ty c) (VSigma ty' c') = convTy' ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
   convTy s t
-convTy (VPi ty c) (VPi ty' c') = convTy ty ty' &&? do
+convTy (VPi ty c) (VPi ty' c') = convTy' ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
   convTy s t
 convTy VNat VNat = return True
 convTy VUniverse VUniverse = return True
-convTy (VEl t1) (VEl t2) = conv t1 t2
+convTy (VEl t1) (VEl t2) = conv' t1 t2
 convTy _ _ = return False
+
+convTy' :: (Fresh m) => Thunk TyVal -> Thunk TyVal -> m Bool
+convTy' th1 th2 = do
+  v1 <- force th1
+  v2 <- force th2
+  convTy v1 v2

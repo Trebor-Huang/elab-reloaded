@@ -1,9 +1,11 @@
 module Syntax (
   Var, Term(..), Type(..),
   Env, Closure(..), Spine(..),
-  Val(.., VVar), vApp, vFst, vSnd, vSuc, vNatElim,
-  TyVal(..),
-  eval, evalTy, ($$), ($$-), quote, quoteTy, nf, nfSubst
+  Val(.. {- exclude VNeutral -}, VVar), vApp, vFst, vSnd, vSuc, vNatElim,
+  TyVal(..), Thunk (Thunk), force,
+  eval, evalTy, ($$), ($$-),
+  quote, quoteTy,
+  nf, nfSubst
 ) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
@@ -27,7 +29,7 @@ data Term
     {- arg -} Term
   | Quote Type
   | The Type Term
-  deriving (Generic)
+  deriving (Generic) -- TODO get a readback to raw terms and test roundtrip
 
 showTermM :: Int -> Term -> LFreshM ShowS
 showTermM i = \case
@@ -187,8 +189,16 @@ nfSubst = runFreshM . substnf
 type Env = [(Var, Val)]
 data Closure r t = Closure Env (Bind r t) deriving Show
 
+-- Some metavariables may have been solved; remind us to look up the newest one.
+-- Principle: if we immediately want to case split on the variable, then
+-- make the input type a Thunk. Generally always make the output Thunk.
+newtype Thunk a = Thunk { unthunk :: a } deriving Show
+-- use unthunk to disregard this, and use force to make the update
+force :: Monad m => Thunk a -> m a
+force (Thunk a) = return a
+
 data Spine
-  = VApp {- -} Val
+  = VApp {- -} (Thunk Val)
   | VFst {- -} | VSnd {- -}
   | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) {- -}
   deriving Show
@@ -197,39 +207,45 @@ data Spine
 data Val
   = VNeutral Var [Spine]
   | VLam (Closure Var Term)
-  | VPair Val Val
-  | VZero | VSuc Int Val
-  | VQuote TyVal
+  | VPair (Thunk Val) (Thunk Val)
+  | VZero | VSuc Int (Thunk Val)
+  | VQuote (Thunk TyVal)
   deriving Show
 
 data TyVal
-  = VSigma TyVal (Closure Var Type)
-  | VPi TyVal (Closure Var Type)
+  = VSigma (Thunk TyVal) (Closure Var Type)
+  | VPi (Thunk TyVal) (Closure Var Type)
   | VNat
   | VUniverse
-  | VEl Val
+  | VEl (Thunk Val)
   deriving Show
 
+-- Patterns for constructing values.
+-- These should not look under metas, so they use "unthunk"
 pattern VVar :: Var -> Val
 pattern VVar x = VNeutral x []
 
 vApp :: Fresh m => Val -> Val -> m Val
 vApp t u = case t of
   VLam t' -> snd <$> t' $$ \x -> [(x, u)]
-  VNeutral v sp -> return $ VNeutral v (VApp u : sp)
+  VNeutral v sp -> return $ VNeutral v (VApp (Thunk u) : sp)
   _ -> error "Impossible"
 
 vFst, vSnd, vSuc :: Val -> Val
-vFst (VPair t _) = t
+vFst (VPair t _) = unthunk t
 vFst (VNeutral v sp) = VNeutral v (VFst:sp)
 vFst _ = error "Impossible"
 
-vSnd (VPair _ t) = t
+vSnd (VPair _ t) = unthunk t
 vSnd (VNeutral v sp) = VNeutral v (VSnd:sp)
 vSnd _ = error "Impossible"
 
 vSuc (VSuc k v') = VSuc (k+1) v'
-vSuc v = VSuc 1 v
+vSuc v = VSuc 1 (Thunk v)
+
+vEl :: Val -> TyVal
+vEl (VQuote ty) = unthunk ty
+vEl v = VEl (Thunk v)
 
 vNatElim :: Fresh m
   => Closure Var Type
@@ -238,8 +254,8 @@ vNatElim :: Fresh m
   -> Val -> m Val
 vNatElim m z s = \case
   VZero -> snd <$> z $$ \() -> []
-  VSuc _ (VSuc _ _) -> error "Internal error: stacked VSuc"
-  VSuc k v -> do
+  VSuc _ (Thunk (VSuc _ _)) -> error "Internal error: stacked VSuc"
+  VSuc k (Thunk v) -> do
     vrec <- vNatElim m z s v
     go k vrec
   VNeutral v sp -> return $ VNeutral v (VNatElim m z s : sp)
@@ -248,8 +264,9 @@ vNatElim m z s = \case
     go 0 v = return v
     go k v = do
       v' <- go (k-1) v
-      snd <$> s $$ \(n,r) -> [(n, VSuc k VZero), (r, v')]
+      snd <$> s $$ \(n,r) -> [(n, VSuc k (Thunk VZero)), (r, v')]
 
+-- Eval will unfold the (surface) metas, so we return `Val` not `Thunk Val`
 eval :: Fresh m => Env -> Term -> m Val
 eval env = \case
   Var x -> return $ fromJust $ lookup x env
@@ -258,7 +275,10 @@ eval env = \case
     v1 <- eval env t1
     v2 <- eval env t2
     vApp v1 v2
-  Pair t1 t2 -> VPair <$> eval env t1 <*> eval env t2
+  Pair t1 t2 -> do
+    v1 <- eval env t1
+    v2 <- eval env t2
+    return $ VPair (Thunk v1) (Thunk v2)
   Fst t -> vFst <$> eval env t
   Snd t -> vSnd <$> eval env t
   Zero -> return VZero
@@ -266,24 +286,20 @@ eval env = \case
   NatElim m z s t -> do
     v <- eval env t
     vNatElim (Closure env m) (Closure env (bind () z)) (Closure env s) v
-  Quote ty -> VQuote <$> evalTy env ty
+  Quote ty -> VQuote . Thunk <$> evalTy env ty
   The _ tm -> eval env tm
 
 evalTy :: Fresh m => Env -> Type -> m TyVal
 evalTy env = \case
   Sigma t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VSigma v1 (Closure env t2)
+    return $ VSigma (Thunk v1) (Closure env t2)
   Pi t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VPi v1 (Closure env t2)
+    return $ VPi (Thunk v1) (Closure env t2)
   Nat -> return VNat
   Universe -> return VUniverse
-  El t -> do
-    v <- eval env t
-    case v of
-      VQuote ty -> return ty
-      _ -> return $ VEl v
+  El t -> vEl <$> eval env t
 
 ($$) :: (Fresh m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$) (Closure env t) r = do
@@ -301,7 +317,9 @@ quote :: Fresh m => Val -> m Term
 quote (VNeutral v sp) = foldrM go (Var v) sp
   where
     go s val = case s of
-      VApp arg -> App val <$> quote arg
+      VApp thunk -> do
+        arg <- force thunk
+        App val <$> quote arg
       VFst -> return $ Fst val
       VSnd -> return $ Snd val
       VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
@@ -318,27 +336,38 @@ quote (VLam c) = do
   (x, c') <- c $$ \x -> [(x, VVar x)]
   t <- quote c'
   return $ Lam (bind x t)
-quote (VPair v1 v2) = Pair <$> quote v1 <*> quote v2
+quote (VPair th1 th2) = do
+  v1 <- force th1
+  v2 <- force th2
+  Pair <$> quote v1 <*> quote v2
 
 quote VZero = return Zero
-quote (VSuc k v) = nTimes k Suc <$> quote v
+quote (VSuc k th) = do
+  v <- force th
+  nTimes k Suc <$> quote v
 
-quote (VQuote ty) = Quote <$> quoteTy ty
+quote (VQuote th) = do
+  ty <- force th
+  Quote <$> quoteTy ty
 
 quoteTy :: Fresh m => TyVal -> m Type
-quoteTy (VSigma vty c) = do
+quoteTy (VSigma th c) = do
+  vty <- force th
   ty <- quoteTy vty
   (x, c') <- c $$- \x -> [(x, VVar x)]
   t <- quoteTy c'
   return $ Sigma ty (bind x t)
-quoteTy (VPi vty c) = do
+quoteTy (VPi th c) = do
+  vty <- force th
   ty <- quoteTy vty
   (x, c') <- c $$- \x -> [(x, VVar x)]
   t <- quoteTy c'
   return $ Pi ty (bind x t)
 quoteTy VNat = return Nat
 quoteTy VUniverse = return Universe
-quoteTy (VEl t) = El <$> quote t
+quoteTy (VEl th) = do
+  t <- force th
+  El <$> quote t
 
 nf :: Env -> Term -> Term
 nf env t = runFreshM $ quote =<< eval env t
