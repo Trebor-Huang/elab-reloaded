@@ -5,6 +5,7 @@ module Main (main) where
 import Unbound.Generics.LocallyNameless
 import Raw
 import Syntax
+import NbE
 import TypeCheck
 
 x = s2n "x"
@@ -57,7 +58,7 @@ idterm = RThe
 
 inferSuccess :: Raw -> (Term, Type)
 inferSuccess raw = let Right (tm, vty) = runTyckM $ infer raw in
-  (tm, runFreshM $ quoteTy vty)
+  (tm, runMetaEnvM $ quoteTy vty)
 
 main :: IO ()
 main = do
@@ -67,5 +68,5 @@ main = do
   let (tm, ty) = inferSuccess rterm
   print tm
   print ty
-  print $ nf [] tm
+  print $ nf emptyEnv tm
   print $ nfSubst tm

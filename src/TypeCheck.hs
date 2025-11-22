@@ -11,8 +11,9 @@ import Unbound.Generics.LocallyNameless
 import qualified Data.Map as M
 import Data.Coerce (coerce)
 
-import Syntax
 import Raw
+import Syntax
+import NbE
 import Utils
 
 data Context = Context {
@@ -34,39 +35,30 @@ bindEnv var val ctx = ctx {
   env = M.insert var val (env ctx)
 }
 
-class (MonadError String m, MonadReader Context m, MonadEnv m) => Tyck m
+class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m
 
-evalM :: (MonadReader Context m, MonadEnv m) => Term -> m Val
+evalM :: (MonadReader Context m, MonadMEnv m) => Term -> m Val
 evalM tm = do
   e <- asks env
   eval e tm
 
-evalTyM :: (MonadReader Context m, MonadEnv m) => Type -> m TyVal
+evalTyM :: (MonadReader Context m, MonadMEnv m) => Type -> m TyVal
 evalTyM ty = do
   e <- asks env
   evalTy e ty
-
-type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
-instance MonadEnv TyckM
-instance Tyck TyckM
-runTyckM :: TyckM a -> Either String a
-runTyckM m = runFreshM $
-  runExceptT $
-  runReaderT (evalStateT m emptyMetaEnv)
-    emptyContext
 
 check :: Tyck m => Raw -> TyVal -> m Term
 check (RLam f) (VPi thdom cod) = do
   (x, t) <- unbind f
   let x' = coerce x :: Var
-  (_, ty) <- cod $$- \y -> [(y, VVar x')]
+  ty <- cod $$: \y -> [(y, VVar x')]
   t' <- local (newVar x x' thdom) $ check t ty
   return $ Lam $ bind x' t'
 
 check (RPair s1 s2) (VSigma t1 t2) = do
   s1' <- check s1 t1
   v1 <- evalM s1'
-  (_, t2') <- t2 $$- \y -> [(y, v1)]
+  t2' <- t2 $$: \y -> [(y, v1)]
   s2' <- check s2 t2'
   return $ Pair s1' s2'
 
@@ -123,7 +115,7 @@ infer (RApp rfun rarg) = do
     VPi dom cod -> do
       arg <- check rarg dom
       varg <- evalM arg
-      (_, vcod) <- cod $$- \y -> [(y, varg)]
+      vcod <- cod $$: \y -> [(y, varg)]
       return (App fun arg, vcod)
     _ -> throwError $ "Expected Pi type: " ++ show ty
 infer (RLam _) = throwError "Unable to infer type of lambda"
@@ -141,7 +133,7 @@ infer (RSnd r) = do
   case ty of
     VSigma _ ty2 -> do
       varg <- evalM (Fst t)
-      (_, sty2) <- ty2 $$- \y -> [(y, varg)]
+      sty2 <- ty2 $$: \y -> [(y, varg)]
       return (Snd t, sty2)
     _ -> throwError "Expected Sigma type"
 infer (RPair _ _) = throwError "Unable to infer type of pairs"
@@ -179,7 +171,7 @@ infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can in
 
 infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
 
-convSp :: MonadEnv m => [Spine] -> [Spine] -> m Bool
+convSp :: MonadMEnv m => [Spine] -> [Spine] -> m Bool
 convSp [] [] = return True
 convSp (s:sp) (s':sp') = convSp sp sp' &&? case (s, s') of
   (VApp s, VApp s') -> conv' s s'
@@ -189,17 +181,17 @@ convSp (s:sp) (s':sp') = convSp sp sp' &&? case (s, s') of
     -- since we are assuming they have the same type,
     -- conversion should not depend on the motive
     (do
-      (_, vz) <- z $$ \() -> []
-      (_, vz') <- z' $$ \() -> []
+      vz <- z $$ \() -> []
+      vz' <- z' $$ \() -> []
       conv vz vz')
     &&? (do
-      ((m, k), vs) <- s $$ \(m, k) -> [(m, VVar m), (k, VVar k)]
-      (_, vs') <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
+      ((m, k), vs) <- s $$+ \(m, k) -> [(m, VVar m), (k, VVar k)]
+      vs' <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
       conv vs vs')
   _ -> return False
 convSp _ _ = return False
 
-conv :: MonadEnv m => Val -> Val -> m Bool
+conv :: MonadMEnv m => Val -> Val -> m Bool
 conv
   (VNeutral (Left (MetaVar _ mid subs)) sp)
   (VNeutral (Left (MetaVar _ mid' subs')) sp') | mid == mid' = convSp sp sp'
@@ -208,16 +200,17 @@ conv (VNeutral (Right v) sp) (VNeutral (Right v') sp')
   = return (v == v') &&? convSp sp sp'
 
 conv (VLam f) (VLam g) = do
-  (x, s) <- f $$ \x -> [(x, VVar x)]
-  (_, t) <- g $$ \y -> [(y, VVar x)]
-  -- TODO abstract this pattern and avoid having ($$) leak its variables
+  -- We can use a fresh variable, but that loses the name information
+  -- so we use this slighly cursed leaking implementation
+  (x, s) <- f $$+ \x -> [(x, VVar x)]
+  t <- g $$ \y -> [(y, VVar x)]
   conv' (Thunk s) (Thunk t)
 conv (VLam f) g = do
-  (x, s) <- f $$ \x -> [(x, VVar x)]
+  (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
   conv' (Thunk s) (Thunk t)
 conv g (VLam f) = do
-  (x, s) <- f $$ \x -> [(x, VVar x)]
+  (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
   conv' (Thunk s) (Thunk t)
 
@@ -236,22 +229,32 @@ conv tm (VQuote ty) =
 
 conv _ _ = return False
 
-conv' :: MonadEnv m => Thunk -> Thunk -> m Bool
+conv' :: MonadMEnv m => Thunk -> Thunk -> m Bool
 conv' th1 th2 = do
   v1 <- force th1
   v2 <- force th2
   conv v1 v2
 
-convTy :: MonadEnv m => TyVal -> TyVal -> m Bool
+convTy :: MonadMEnv m => TyVal -> TyVal -> m Bool
 convTy (VSigma ty c) (VSigma ty' c') = convTy ty ty' &&? do
-  (x, s) <- c $$- \x -> [(x, VVar x)]
-  (_, t) <- c' $$- \y -> [(y, VVar x)]
+  (x, s) <- c $$:+ \x -> [(x, VVar x)]
+  t <- c' $$: \y -> [(y, VVar x)]
   convTy s t
 convTy (VPi ty c) (VPi ty' c') = convTy ty ty' &&? do
-  (x, s) <- c $$- \x -> [(x, VVar x)]
-  (_, t) <- c' $$- \y -> [(y, VVar x)]
+  (x, s) <- c $$:+ \x -> [(x, VVar x)]
+  t <- c' $$: \y -> [(y, VVar x)]
   convTy s t
 convTy VNat VNat = return True
 convTy VUniverse VUniverse = return True
 convTy (VEl t1) (VEl t2) = conv' t1 t2
 convTy _ _ = return False
+
+----- Example monad to use functions ----
+type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
+instance MonadMEnv TyckM
+instance Tyck TyckM
+runTyckM :: TyckM a -> Either String a
+runTyckM m = runFreshM $
+  runExceptT $
+  runReaderT (evalStateT m emptyMetaEnv)
+    emptyContext
