@@ -9,3 +9,8 @@ nTimes n f = f . nTimes (n-1) f
 p &&? q = do
   b <- p
   if b then q else return False
+
+zip' :: [a] -> [b] -> [(a, b)]
+zip' [] [] = []
+zip' (a:as) (b:bs) = (a,b) : zip' as bs
+zip' _ _ = error "zip': uneven lists"

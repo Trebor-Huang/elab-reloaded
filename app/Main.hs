@@ -57,7 +57,7 @@ idterm = RThe
 
 inferSuccess :: Raw -> (Term, Type)
 inferSuccess raw = let Right (tm, vty) = runTyckM $ infer raw in
-  (tm, runFreshM $ quoteTy =<< force vty)
+  (tm, runFreshM $ quoteTy vty)
 
 main :: IO ()
 main = do

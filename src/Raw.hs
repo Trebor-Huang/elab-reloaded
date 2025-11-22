@@ -32,6 +32,7 @@ data Raw
   | RNat
   | RUniverse -- implicit Coquand universe
   | RThe Raw Raw
+  | RHole
   deriving (Generic, Show)
 
 instance Alpha Raw
@@ -48,6 +49,7 @@ data ParseTree
   = TNode Identifier [([Identifier], ParseTree)]
   | TApp ParseTree ParseTree
   | TInt Integer
+  | THole
   deriving Show
 
 spaceEater :: Parser ()
@@ -83,6 +85,7 @@ pIdent = try (do
 pAtom :: Parser ParseTree
 pAtom = choice [
     TInt <$> lexeme L.decimal,
+    THole <$ symbol "_",
     try pCons,
     (`TNode` []) <$> pIdent,
     parens pRaw
@@ -150,6 +153,8 @@ toRaw = runExcept . runFreshMT . go []
     pushVar x vx = if x == "_" then id else ((x,vx):)
 
     go :: [(Identifier, RVar)] -> ParseTree -> FreshMT (Except String) Raw
+    go _ THole = return RHole
+
     go env (TNode "Lam" [([x], b)]) = do
       v <- fresh (s2n x)
       RLam . bind v <$> go (pushVar x v env) b

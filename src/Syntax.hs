@@ -1,24 +1,34 @@
 module Syntax (
-  Var, Term(..), Type(..),
-  Env, Closure(..), Spine(..),
-  Val(.. {- exclude VNeutral -}, VVar), vApp, vFst, vSnd, vSuc, vNatElim,
+  Var, MetaVar(..), Term(..), Type(..),
+  Env, MetaEnv(..), MonadEnv, emptyMetaEnv,
+  Closure(..), Spine(..),
+  Val(.. {- exclude VNeutral -}, VVar),
+  vApp, vFst, vSnd, vSuc, vNatElim,
   TyVal(..), Thunk (Thunk), force,
   eval, evalTy, ($$), ($$-),
   quote, quoteTy,
-  nf, nfSubst
+  -- nf,
+  nfSubst
 ) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Data.Maybe (fromJust)
 import Data.Foldable (foldrM)
+import qualified Data.IntMap as IM
+import qualified Data.Map as M
+import Control.Monad.State
 import Control.Lens (anyOf)
 
 import Utils
 
 type Var = Name Term
+data MetaVar a = MetaVar
+  {- suggested name -} !String
+  {- metavar id -} !Int
+  {- stuck substitution -} ![a] deriving (Show, Generic)
 
 data Term
-  = Var Var
+  = Var Var | MVar (MetaVar Term)
   | Lam (Bind Var Term) | App Term Term
   | Pair Term Term | Fst Term | Snd Term
   | Zero | Suc Term
@@ -34,6 +44,9 @@ data Term
 showTermM :: Int -> Term -> LFreshM ShowS
 showTermM i = \case
   Var x -> return (showsPrec i x)
+  MVar (MetaVar name _ subs) ->
+    (\tms -> shows name . showList (map (\x -> x "") tms)) <$>
+    mapM (showTermM 0) subs
   Lam t -> lunbind t \(x, t') -> do
     s <- showTermM 0 t'
     return (showParen (i > 0) $
@@ -123,6 +136,7 @@ showTypeM i = \case
 instance Show Type where
   showsPrec i t = runLFreshM (showTypeM i t)
 
+instance Alpha a => Alpha (MetaVar a)
 instance Alpha Term
 instance Alpha Type
 
@@ -132,9 +146,13 @@ instance Subst Term Term where
 
 instance Subst Term Type
 
+instance Subst Term (MetaVar Term)
+
 ----- Substitution based normalization -----
 substnf :: Term -> FreshM Term
 substnf (Var x) = return $ Var x
+substnf (MVar (MetaVar name mid subs))
+  = MVar . MetaVar name mid <$> mapM substnf subs
 substnf (Lam t) = do
   (y, t') <- unbind t
   Lam . bind y <$> substnf t'
@@ -186,46 +204,77 @@ nfSubst :: Term -> Term
 nfSubst = runFreshM . substnf
 
 ----- Normalization by Evaluation -----
-type Env = [(Var, Val)]
+type Env = M.Map Var Val
+data MetaEnv = MetaEnv {
+  nextMVar :: Int,
+  solutions :: IM.IntMap (Closure [Var] Term) }
+emptyMetaEnv :: MetaEnv
+emptyMetaEnv = MetaEnv 0 IM.empty
+
+class (Fresh m, MonadState MetaEnv m) => MonadEnv m
+
 data Closure r t = Closure Env (Bind r t) deriving Show
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
 -- make the input type a Thunk. Generally always make the output Thunk.
-newtype Thunk a = Thunk { unthunk :: a } deriving Show
+newtype Thunk = Thunk { unthunk :: Val } deriving Show
 -- use unthunk to disregard this, and use force to make the update
-force :: Monad m => Thunk a -> m a
-force (Thunk a) = return a
 
 data Spine
-  = VApp {- -} (Thunk Val)
+  = VApp {- -} Thunk
   | VFst {- -} | VSnd {- -}
   | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) {- -}
   deriving Show
 -- There should be a TySpine in principle but it's just VEl by itself...
 
 data Val
-  = VNeutral Var [Spine]
+  = VNeutral !(Either (MetaVar Val) Var) [Spine]
   | VLam (Closure Var Term)
-  | VPair (Thunk Val) (Thunk Val)
-  | VZero | VSuc Int (Thunk Val)
-  | VQuote (Thunk TyVal)
+  | VPair Thunk Thunk
+  | VZero | VSuc Int Thunk
+  | VQuote TyVal
   deriving Show
 
 data TyVal
-  = VSigma (Thunk TyVal) (Closure Var Type)
-  | VPi (Thunk TyVal) (Closure Var Type)
+  = VSigma TyVal (Closure Var Type)
+  | VPi TyVal (Closure Var Type)
   | VNat
   | VUniverse
-  | VEl (Thunk Val)
+  | VEl Thunk
   deriving Show
 
 -- Patterns for constructing values.
 -- These should not look under metas, so they use "unthunk"
 pattern VVar :: Var -> Val
-pattern VVar x = VNeutral x []
+pattern VVar x = VNeutral (Right x) []
 
-vApp :: Fresh m => Val -> Val -> m Val
+vMeta :: MonadEnv m => MetaVar Val -> [Spine] -> m Val
+vMeta m@(MetaVar _ mid subs) sp = do
+  sol <- gets (IM.lookup mid . solutions)
+  case sol of
+    Just b -> do
+      (_, val) <- b $$ (`zip'` subs)
+      vSpine val sp
+    Nothing -> return $ VNeutral (Left m) sp
+
+vSpine :: MonadEnv m => Val -> [Spine] -> m Val
+vSpine v [] = return v
+vSpine v (c:sp) = case c of
+  VApp th -> do
+    v' <- vApp (unthunk th) v
+    vSpine v' sp
+  VFst -> vSpine (vFst v) sp
+  VSnd -> vSpine (vSnd v) sp
+  VNatElim m z s -> do
+    v' <- vNatElim m z s v
+    vSpine v' sp
+
+force :: MonadEnv m => Thunk -> m Val
+force (Thunk (VNeutral (Left m) sp)) = vMeta m sp
+force (Thunk a) = return a
+
+vApp :: MonadEnv m => Val -> Val -> m Val
 vApp t u = case t of
   VLam t' -> snd <$> t' $$ \x -> [(x, u)]
   VNeutral v sp -> return $ VNeutral v (VApp (Thunk u) : sp)
@@ -244,10 +293,10 @@ vSuc (VSuc k v') = VSuc (k+1) v'
 vSuc v = VSuc 1 (Thunk v)
 
 vEl :: Val -> TyVal
-vEl (VQuote ty) = unthunk ty
+vEl (VQuote ty) = ty
 vEl v = VEl (Thunk v)
 
-vNatElim :: Fresh m
+vNatElim :: MonadEnv m
   => Closure Var Type
   -> Closure () Term
   -> Closure (Var, Var) Term
@@ -266,11 +315,13 @@ vNatElim m z s = \case
       v' <- go (k-1) v
       snd <$> s $$ \(n,r) -> [(n, VSuc k (Thunk VZero)), (r, v')]
 
--- Eval will unfold the (surface) metas, so we return `Val` not `Thunk Val`
-eval :: Fresh m => Env -> Term -> m Val
+-- Eval will unfold the (surface) metas, so we return `Val` not `Thunk`
+eval :: MonadEnv m => Env -> Term -> m Val
 eval env = \case
-  Var x -> return $ fromJust $ lookup x env
-  Lam s -> return $ VLam (Closure env s)
+  Var x -> return $ fromJust $ M.lookup x env
+  MVar (MetaVar name mid subs)
+    -> (`vMeta` []) . MetaVar name mid =<< mapM (eval env) subs
+  Lam s -> return $ VLam $ Closure env s
   App t1 t2 -> do
     v1 <- eval env t1
     v2 <- eval env t2
@@ -286,35 +337,40 @@ eval env = \case
   NatElim m z s t -> do
     v <- eval env t
     vNatElim (Closure env m) (Closure env (bind () z)) (Closure env s) v
-  Quote ty -> VQuote . Thunk <$> evalTy env ty
+  Quote ty -> VQuote <$> evalTy env ty
   The _ tm -> eval env tm
 
-evalTy :: Fresh m => Env -> Type -> m TyVal
+evalTy :: MonadEnv m => Env -> Type -> m TyVal
 evalTy env = \case
   Sigma t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VSigma (Thunk v1) (Closure env t2)
+    return $ VSigma v1 (Closure env t2)
   Pi t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VPi (Thunk v1) (Closure env t2)
+    return $ VPi v1 (Closure env t2)
   Nat -> return VNat
   Universe -> return VUniverse
   El t -> vEl <$> eval env t
 
-($$) :: (Fresh m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
+($$) :: (MonadEnv m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$) (Closure env t) r = do
   (x, s) <- unbind t
-  s' <- eval (r x ++ env) s
+  s' <- eval (M.union (M.fromList (r x)) env) s
   return (x, s')
 
-($$-) :: (Fresh m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (p, TyVal)
+($$-) :: (MonadEnv m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (p, TyVal)
 ($$-) (Closure env t) r = do
   (x, s) <- unbind t
-  s' <- evalTy (r x ++ env) s
+  s' <- evalTy (M.union (M.fromList (r x)) env) s
   return (x, s')
 
-quote :: Fresh m => Val -> m Term
-quote (VNeutral v sp) = foldrM go (Var v) sp
+quote :: MonadEnv m => Val -> m Term
+quote (VNeutral v sp) = do
+  v' <- case v of
+    Left (MetaVar name mid subs)
+      -> MVar . MetaVar name mid <$> mapM quote subs
+    Right v0 -> return $ Var v0
+  foldrM go v' sp
   where
     go s val = case s of
       VApp thunk -> do
@@ -346,19 +402,15 @@ quote (VSuc k th) = do
   v <- force th
   nTimes k Suc <$> quote v
 
-quote (VQuote th) = do
-  ty <- force th
-  Quote <$> quoteTy ty
+quote (VQuote ty) = Quote <$> quoteTy ty
 
-quoteTy :: Fresh m => TyVal -> m Type
-quoteTy (VSigma th c) = do
-  vty <- force th
+quoteTy :: MonadEnv m => TyVal -> m Type
+quoteTy (VSigma vty c) = do
   ty <- quoteTy vty
   (x, c') <- c $$- \x -> [(x, VVar x)]
   t <- quoteTy c'
   return $ Sigma ty (bind x t)
-quoteTy (VPi th c) = do
-  vty <- force th
+quoteTy (VPi vty c) = do
   ty <- quoteTy vty
   (x, c') <- c $$- \x -> [(x, VVar x)]
   t <- quoteTy c'
@@ -369,5 +421,7 @@ quoteTy (VEl th) = do
   t <- force th
   El <$> quote t
 
-nf :: Env -> Term -> Term
-nf env t = runFreshM $ quote =<< eval env t
+-- nf :: Env -> Term -> Term
+-- nf env t = runFreshM $ flip runReader env do
+--   v <- eval t
+--   lift $ quote v

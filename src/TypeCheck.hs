@@ -4,9 +4,11 @@ module TypeCheck (
   check, checkTy, infer, conv, convTy
 ) where
 import Control.Monad
+import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless
+import qualified Data.Map as M
 import Data.Coerce (coerce)
 
 import Syntax
@@ -14,40 +16,44 @@ import Raw
 import Utils
 
 data Context = Context {
-  env :: Env,  -- environment for evaluation  -- TODO should this be Thunked?
-  vars :: [(RVar, Thunk TyVal)]  -- types of raw variables
+  env :: Env,  -- environment for evaluation
+  vars :: [(RVar, TyVal)]  -- types of raw variables
 }
 
 emptyContext :: Context
-emptyContext = Context [] []
+emptyContext = Context M.empty []
 
-newVar :: RVar -> Var -> Thunk TyVal -> Context -> Context
+newVar :: RVar -> Var -> TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
-  env = (var, VVar var) : env ctx,
+  env = M.insert var (VVar var) (env ctx),
   vars = (vraw, ty) : vars ctx
 }
 
 bindEnv :: Var -> Val -> Context -> Context
 bindEnv var val ctx = ctx {
-  env = (var, val) : env ctx
+  env = M.insert var val (env ctx)
 }
 
-class (MonadError String m, MonadReader Context m, Fresh m) => Tyck m
+class (MonadError String m, MonadReader Context m, MonadEnv m) => Tyck m
 
-evalM :: (MonadReader Context m, Fresh m) => Term -> m Val
+evalM :: (MonadReader Context m, MonadEnv m) => Term -> m Val
 evalM tm = do
   e <- asks env
   eval e tm
 
-evalTyM :: (MonadReader Context m, Fresh m) => Type -> m TyVal
+evalTyM :: (MonadReader Context m, MonadEnv m) => Type -> m TyVal
 evalTyM ty = do
   e <- asks env
   evalTy e ty
 
-type TyckM = ReaderT Context (ExceptT String FreshM)
+type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
+instance MonadEnv TyckM
 instance Tyck TyckM
 runTyckM :: TyckM a -> Either String a
-runTyckM m = runFreshM $ runExceptT $ runReaderT m emptyContext
+runTyckM m = runFreshM $
+  runExceptT $
+  runReaderT (evalStateT m emptyMetaEnv)
+    emptyContext
 
 check :: Tyck m => Raw -> TyVal -> m Term
 check (RLam f) (VPi thdom cod) = do
@@ -57,8 +63,7 @@ check (RLam f) (VPi thdom cod) = do
   t' <- local (newVar x x' thdom) $ check t ty
   return $ Lam $ bind x' t'
 
-check (RPair s1 s2) (VSigma th1 t2) = do
-  t1 <- force th1
+check (RPair s1 s2) (VSigma t1 t2) = do
   s1' <- check s1 t1
   v1 <- evalM s1'
   (_, t2') <- t2 $$- \y -> [(y, v1)]
@@ -70,8 +75,7 @@ check RZero VNat = return Zero
 check (RSuc t) VNat = Suc <$> check t VNat
 
 check tm ty = do
-  (tm', thty') <- infer tm
-  ty' <- force thty'
+  (tm', ty') <- infer tm
   p <- convTy ty ty'
   unless p do
     throwError "Expected ..."
@@ -80,14 +84,14 @@ check tm ty = do
 checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
 checkTy (RPi rdom rc) = do
   dom <- checkTy rdom
-  vdom <- Thunk <$> evalTyM dom
+  vdom <- evalTyM dom
   (x, rcod) <- unbind rc
   let x' = coerce x :: Var
   cod <- local (newVar x x' vdom) $ checkTy rcod
   return (Pi dom (bind x' cod)) -- ?
 checkTy (RSigma rty1 rc) = do
   ty1 <- checkTy rty1
-  vty1 <- Thunk <$> evalTyM ty1
+  vty1 <- evalTyM ty1
   (x, rty2) <- unbind rc
   let x' = coerce x :: Var
   ty2 <- local (newVar x x' vty1) $ checkTy rty2
@@ -98,12 +102,14 @@ checkTy rtm = do
   tm' <- check rtm VUniverse
   return (El tm')
 
-infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
+infer :: Tyck m => Raw -> m (Term, TyVal)
+infer RHole = error "todo"
+
 infer (RThe rty rtm) = do
   ty <- checkTy rty
   vty <- evalTyM ty
   tm <- check rtm vty
-  return (The ty tm, Thunk vty)
+  return (The ty tm, vty)
 
 infer (RVar x) = do
   vs <- asks vars
@@ -112,52 +118,48 @@ infer (RVar x) = do
     Nothing -> throwError $ "Variable out of scope: " ++ show x
 
 infer (RApp rfun rarg) = do
-  (fun, thty) <- infer rfun
-  ty <- force thty
+  (fun, ty) <- infer rfun
   case ty of
-    VPi thdom cod -> do
-      dom <- force thdom
+    VPi dom cod -> do
       arg <- check rarg dom
       varg <- evalM arg
       (_, vcod) <- cod $$- \y -> [(y, varg)]
-      return (App fun arg, Thunk vcod)
+      return (App fun arg, vcod)
     _ -> throwError $ "Expected Pi type: " ++ show ty
 infer (RLam _) = throwError "Unable to infer type of lambda"
 infer rty@RPi {} = do
   ty <- checkTy rty
-  return (Quote ty, Thunk VUniverse)
+  return (Quote ty, VUniverse)
 
 infer (RFst r) = do
-  (t, thty) <- infer r
-  ty <- force thty
+  (t, ty) <- infer r
   case ty of
     VSigma ty1 _ -> return (Fst t, ty1)
     _ -> throwError "Expected Sigma type"
 infer (RSnd r) = do
-  (t, thty) <- infer r
-  ty <- force thty
+  (t, ty) <- infer r
   case ty of
     VSigma _ ty2 -> do
       varg <- evalM (Fst t)
       (_, sty2) <- ty2 $$- \y -> [(y, varg)]
-      return (Snd t, Thunk sty2)
+      return (Snd t, sty2)
     _ -> throwError "Expected Sigma type"
 infer (RPair _ _) = throwError "Unable to infer type of pairs"
 infer rty@RSigma {} = do
   ty <- checkTy rty
-  return (Quote ty, Thunk VUniverse)
+  return (Quote ty, VUniverse)
 
-infer RZero = return (Zero, Thunk VNat)
+infer RZero = return (Zero, VNat)
 infer (RSuc r) = do
   t <- check r VNat
-  return (Suc t, Thunk VNat)
+  return (Suc t, VNat)
 infer (RNatElim rmc rz rsc rarg) = do
   -- check argument
   arg <- check rarg VNat
   -- check motive
   (n, rm) <- unbind rmc
   let n' = coerce n :: Var
-  tym <- local (newVar n n' (Thunk VNat)) $ checkTy rm
+  tym <- local (newVar n n' VNat) $ checkTy rm
   -- check zero argument
   tym_z <- local (bindEnv n' VZero) $ evalTyM tym
   tz <- check rz tym_z
@@ -167,37 +169,43 @@ infer (RNatElim rmc rz rsc rarg) = do
   let r' = coerce r :: Var
   tyr_s <- local (bindEnv n' (VVar x')) $ evalTyM tym
   tym_s <- local (bindEnv n' (VSuc 1 (Thunk (VVar x')))) $ evalTyM tym
-  ts <- local (newVar x x' (Thunk VNat) . newVar r r' (Thunk tyr_s))
+  ts <- local (newVar x x' VNat . newVar r r' tyr_s)
     $ check rs tym_s
   -- evaluate the type
   varg <- evalM arg
   ty <- local (bindEnv n' varg) $ evalTyM tym
-  return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, Thunk ty)
-infer RNat = return (Quote Nat, Thunk VUniverse) -- since it's just one step we can inline it
+  return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, ty)
+infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can inline it
 
-infer RUniverse = return (Quote Universe, Thunk VUniverse) -- todo add universe constraint (i.e. don't inline this)
+infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
 
-conv :: (Fresh m) => Val -> Val -> m Bool
-conv (VNeutral v sp) (VNeutral v' sp') | v == v' = go sp sp'
-  where
-    go [] [] = return True
-    go (s:sp) (s':sp') = go sp sp' &&? case (s, s') of
-      (VApp s, VApp s') -> conv' s s'
-      (VFst, VFst) -> return True
-      (VSnd, VSnd) -> return True
-      (VNatElim _ z s, VNatElim _ z' s') ->
-        -- since we are assuming they have the same type,
-        -- conversion should not depend on the motive
-        (do
-          (_, vz) <- z $$ \() -> []
-          (_, vz') <- z' $$ \() -> []
-          conv vz vz')
-        &&? (do
-          ((m, k), vs) <- s $$ \(m, k) -> [(m, VVar m), (k, VVar k)]
-          (_, vs') <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
-          conv vs vs')
-      _ -> return False
-    go _ _ = return False
+convSp :: MonadEnv m => [Spine] -> [Spine] -> m Bool
+convSp [] [] = return True
+convSp (s:sp) (s':sp') = convSp sp sp' &&? case (s, s') of
+  (VApp s, VApp s') -> conv' s s'
+  (VFst, VFst) -> return True
+  (VSnd, VSnd) -> return True
+  (VNatElim _ z s, VNatElim _ z' s') ->
+    -- since we are assuming they have the same type,
+    -- conversion should not depend on the motive
+    (do
+      (_, vz) <- z $$ \() -> []
+      (_, vz') <- z' $$ \() -> []
+      conv vz vz')
+    &&? (do
+      ((m, k), vs) <- s $$ \(m, k) -> [(m, VVar m), (k, VVar k)]
+      (_, vs') <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
+      conv vs vs')
+  _ -> return False
+convSp _ _ = return False
+
+conv :: MonadEnv m => Val -> Val -> m Bool
+conv
+  (VNeutral (Left (MetaVar _ mid subs)) sp)
+  (VNeutral (Left (MetaVar _ mid' subs')) sp') | mid == mid' = convSp sp sp'
+  -- todo: substitution part
+conv (VNeutral (Right v) sp) (VNeutral (Right v') sp')
+  = return (v == v') &&? convSp sp sp'
 
 conv (VLam f) (VLam g) = do
   (x, s) <- f $$ \x -> [(x, VVar x)]
@@ -220,28 +228,26 @@ conv m (VPair s t) = conv' s (Thunk (vFst m)) &&? conv' t (Thunk (vSnd m))
 conv VZero VZero = return True
 conv (VSuc n t) (VSuc m s) = return (n == m) &&? conv' t s
 
-conv (VQuote ty1) (VQuote ty2) = convTy' ty1 ty2
-conv (VQuote thty) tm = do -- Is this necessary?
-  ty <- force thty
+conv (VQuote ty1) (VQuote ty2) = convTy ty1 ty2
+conv (VQuote ty) tm = -- Is this necessary?
   convTy ty (VEl (Thunk tm))
-conv tm (VQuote thty) = do
-  ty <- force thty
+conv tm (VQuote ty) =
   convTy ty (VEl (Thunk tm))
 
 conv _ _ = return False
 
-conv' :: (Fresh m) => Thunk Val -> Thunk Val -> m Bool
+conv' :: MonadEnv m => Thunk -> Thunk -> m Bool
 conv' th1 th2 = do
   v1 <- force th1
   v2 <- force th2
   conv v1 v2
 
-convTy :: Fresh m => TyVal -> TyVal -> m Bool
-convTy (VSigma ty c) (VSigma ty' c') = convTy' ty ty' &&? do
+convTy :: MonadEnv m => TyVal -> TyVal -> m Bool
+convTy (VSigma ty c) (VSigma ty' c') = convTy ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
   convTy s t
-convTy (VPi ty c) (VPi ty' c') = convTy' ty ty' &&? do
+convTy (VPi ty c) (VPi ty' c') = convTy ty ty' &&? do
   (x, s) <- c $$- \x -> [(x, VVar x)]
   (_, t) <- c' $$- \y -> [(y, VVar x)]
   convTy s t
@@ -249,9 +255,3 @@ convTy VNat VNat = return True
 convTy VUniverse VUniverse = return True
 convTy (VEl t1) (VEl t2) = conv' t1 t2
 convTy _ _ = return False
-
-convTy' :: (Fresh m) => Thunk TyVal -> Thunk TyVal -> m Bool
-convTy' th1 th2 = do
-  v1 <- force th1
-  v2 <- force th2
-  convTy v1 v2
