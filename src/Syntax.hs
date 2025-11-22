@@ -81,7 +81,8 @@ instance Show Term where
   showsPrec i t = runLFreshM (showTermM i t)
 
 data Type -- Note there is no type variables
-  = Sigma Type (Bind Var Type)
+  = MTyVar (MetaVar Term)
+  | Sigma Type (Bind Var Type)
   | Pi Type (Bind Var Type)
   | Nat
   | Universe
@@ -94,6 +95,9 @@ occurs x = anyOf fv (== x)
 
 showTypeM :: Int -> Type -> LFreshM ShowS
 showTypeM i = \case
+  MTyVar (MetaVar name _ subs) ->
+    (\tms -> shows name . showList (map (\x -> x "") tms)) <$>
+    mapM (showTermM 0) subs
   Sigma t1 t2 -> do
     s1 <- showTypeM 0 t1
     lunbind t2 \(x, t') -> do
@@ -176,6 +180,8 @@ substnf (Quote ty) = Quote <$> substnft ty
 substnf (The _ tm) = substnf tm
 
 substnft :: Type -> FreshM Type
+substnft (MTyVar (MetaVar name mid subs))
+  = MTyVar . MetaVar name mid <$> mapM substnf subs
 substnft (Sigma t1 t2) = do
   (y, t2') <- unbind t2
   Sigma <$> substnft t1 <*> (bind y <$> substnft t2')
