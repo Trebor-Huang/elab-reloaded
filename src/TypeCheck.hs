@@ -3,12 +3,12 @@ module TypeCheck (
   runTyckM, emptyContext,
   check, checkTy, infer, conv, convTy
 ) where
-import Control.Monad
 import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless
 import qualified Data.Map as M
+import qualified Data.IntMap as IM
 import Data.Coerce (coerce)
 
 import Raw
@@ -37,6 +37,7 @@ bindEnv var val ctx = ctx {
 
 class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m
 
+-- Prepare some primitive operations
 evalM :: (MonadReader Context m, MonadMEnv m) => Term -> m Val
 evalM tm = do
   e <- asks env
@@ -47,7 +48,35 @@ evalTyM ty = do
   e <- asks env
   evalTy e ty
 
+freshMeta :: MonadMEnv m => String -> [a] -> m (MetaVar a)
+freshMeta name env = do
+  state <- get
+  put state { nextMVar = nextMVar state + 1 }
+  return $ MetaVar name (nextMVar state) env
+
+freshAnonMeta :: MonadMEnv m => [a] -> m (MetaVar a)
+freshAnonMeta env = do
+  state <- get
+  let ix = nextMVar state
+  put state { nextMVar = ix + 1 }
+  return $ MetaVar ("?" ++ show ix) (nextMVar state) env
+
+insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m ()
+insertTermSol i s = do
+  -- todo debug check if metavariables are repeated
+  modify \menv -> menv {
+    termSol = IM.insert i s (termSol menv)
+  }
+
+insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m ()
+insertTypeSol i s = do
+  modify \menv -> menv {
+    typeSol = IM.insert i s (typeSol menv)
+  }
+
 check :: Tyck m => Raw -> TyVal -> m Term
+check RHole vty = error "todo"
+
 check (RLam f) (VPi thdom cod) = do
   (x, t) <- unbind f
   let x' = coerce x :: Var
@@ -68,9 +97,7 @@ check (RSuc t) VNat = Suc <$> check t VNat
 
 check tm ty = do
   (tm', ty') <- infer tm
-  p <- convTy ty ty'
-  unless p do
-    throwError "Expected ..."
+  unify [Right (ty, ty')]
   return tm'
 
 checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
@@ -171,83 +198,163 @@ infer RNat = return (Quote Nat, VUniverse) -- since it's just one step we can in
 
 infer RUniverse = return (Quote Universe, VUniverse) -- todo add universe constraint (i.e. don't inline this)
 
-convSp :: MonadMEnv m => [Spine] -> [Spine] -> m Bool
-convSp [] [] = return True
-convSp (s:sp) (s':sp') = convSp sp sp' &&? case (s, s') of
-  (VApp s, VApp s') -> conv' s s'
-  (VFst, VFst) -> return True
-  (VSnd, VSnd) -> return True
-  (VNatElim _ z s, VNatElim _ z' s') ->
+
+----- Unification algorithm -----
+-- the `conv` family of functions output Nothing when it should be postponed,
+-- error when it is definitely not true, and outputs a list of equations otherwise
+
+convSp :: Tyck m => [Spine] -> [Spine] -> m [Equation]
+convSp [] [] = return []
+convSp (s:sp) (s':sp') = (++) <$> convSp sp sp' <*> case (s, s') of
+  (VApp th, VApp th') -> return [Left (th, th')]
+  (VFst, VFst) -> return []
+  (VSnd, VSnd) -> return []
+  (VNatElim _ z s, VNatElim _ z' s') -> do
     -- since we are assuming they have the same type,
     -- conversion should not depend on the motive
-    (do
-      vz <- z $$ \() -> []
-      vz' <- z' $$ \() -> []
-      conv vz vz')
-    &&? (do
-      ((m, k), vs) <- s $$+ \(m, k) -> [(m, VVar m), (k, VVar k)]
-      vs' <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
-      conv vs vs')
-  _ -> return False
-convSp _ _ = return False
+    vz <- z $$ \() -> []
+    vz' <- z' $$ \() -> []
 
-conv :: MonadMEnv m => Val -> Val -> m Bool
-conv
-  (VNeutral (Left (MetaVar _ mid subs)) sp)
-  (VNeutral (Left (MetaVar _ mid' subs')) sp') | mid == mid' = convSp sp sp'
-  -- todo: substitution part
-conv (VNeutral (Right v) sp) (VNeutral (Right v') sp')
-  = return (v == v') &&? convSp sp sp'
+    ((m, k), vs) <- s $$+ \(m, k) -> [(m, VVar m), (k, VVar k)]
+    vs' <- s' $$ \(m', k') -> [(m', VVar m), (k', VVar k)]
+
+    return [Left (Thunk vz, Thunk vz'), Left (Thunk vs, Thunk vs')]
+  _ -> throwError "not convertible"
+convSp _ _ = throwError "not convertible"
+
+conv :: Tyck m => Val -> Val -> m (Maybe [Equation])
+-- rigid-rigid
+conv (VNeutral (Right v) sp) (VNeutral (Right v') sp') =
+  if v == v' then
+    Just <$> convSp sp sp'
+  else
+    throwError "not convertible"
+-- rigid-flex and flex-rigid
+conv (VNeutral (Left m) sp) v =
+  (\b -> if b then Just [] else Nothing) <$> solve m sp v
+conv v m@(VNeutral (Left _) _) = conv m v
 
 conv (VLam f) (VLam g) = do
   -- We can use a fresh variable, but that loses the name information
   -- so we use this slighly cursed leaking implementation
   (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- g $$ \y -> [(y, VVar x)]
-  conv' (Thunk s) (Thunk t)
+  s' <- force (Thunk s)
+  t' <- force (Thunk t)
+  conv s' t'
 conv (VLam f) g = do
   (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
-  conv' (Thunk s) (Thunk t)
-conv g (VLam f) = do
-  (x, s) <- f $$+ \x -> [(x, VVar x)]
-  t <- vApp g (VVar x)
-  conv' (Thunk s) (Thunk t)
+  s' <- force (Thunk s)
+  t' <- force (Thunk t)
+  conv s' t'
+conv g f@VLam {} = conv f g
 
-conv (VPair s1 t1) (VPair s2 t2) = conv' s1 s2 &&? conv' t1 t2
-conv (VPair s t) m = conv' s (Thunk (vFst m)) &&? conv' t (Thunk (vSnd m))
-conv m (VPair s t) = conv' s (Thunk (vFst m)) &&? conv' t (Thunk (vSnd m))
+conv (VPair ths1 tht1) (VPair ths2 tht2) =
+  return $ Just [Left (ths1, ths2), Left (tht1, tht2)]
+conv (VPair ths tht) m =
+  return $ Just [Left (ths, Thunk (vFst m)), Left (tht, Thunk (vSnd m))]
+conv m n@VPair {} = conv n m
 
-conv VZero VZero = return True
-conv (VSuc n t) (VSuc m s) = return (n == m) &&? conv' t s
+conv VZero VZero = return (Just [])
+conv (VSuc n th) (VSuc m th') =
+  if n == m then do
+    t <- force th
+    t' <- force th'
+    conv t t'
+  else
+    throwError "Not convertible"
 
 conv (VQuote ty1) (VQuote ty2) = convTy ty1 ty2
 conv (VQuote ty) tm = -- Is this necessary?
   convTy ty (VEl (Thunk tm))
-conv tm (VQuote ty) =
-  convTy ty (VEl (Thunk tm))
+conv tm tm'@VQuote {} = conv tm' tm
 
-conv _ _ = return False
+conv _ _ = throwError "Not convertible"
 
-conv' :: MonadMEnv m => Thunk -> Thunk -> m Bool
-conv' th1 th2 = do
-  v1 <- force th1
-  v2 <- force th2
-  conv v1 v2
+convTy :: Tyck m => TyVal -> TyVal -> m (Maybe [Equation])
+convTy (VMTyVar m) t =
+  (\b -> if b then Just [] else Nothing) <$> solveTy m t
+convTy t t'@VMTyVar {} = convTy t' t
 
-convTy :: MonadMEnv m => TyVal -> TyVal -> m Bool
-convTy (VSigma ty c) (VSigma ty' c') = convTy ty ty' &&? do
+convTy (VSigma ty c) (VSigma ty' c') = do
   (x, s) <- c $$:+ \x -> [(x, VVar x)]
   t <- c' $$: \y -> [(y, VVar x)]
-  convTy s t
-convTy (VPi ty c) (VPi ty' c') = convTy ty ty' &&? do
+  return $ Just [Right (ty, ty'), Right (s, t)]
+convTy (VPi ty c) (VPi ty' c') = do
   (x, s) <- c $$:+ \x -> [(x, VVar x)]
   t <- c' $$: \y -> [(y, VVar x)]
-  convTy s t
-convTy VNat VNat = return True
-convTy VUniverse VUniverse = return True
-convTy (VEl t1) (VEl t2) = conv' t1 t2
-convTy _ _ = return False
+  return $ Just [Right (ty, ty'), Right (s, t)]
+convTy VNat VNat = return (Just [])
+convTy VUniverse VUniverse = return (Just [])
+convTy (VEl th1) (VEl th2) = do
+  t1 <- force th1
+  t2 <- force th2
+  conv t1 t2
+convTy _ _ = throwError "not convertible"
+
+-- Searches if the substitution and the spine constitutes
+-- a linear set of variables, and if so adds the solution
+solve :: Tyck m => MetaVar Val -> [Spine] -> Val -> m Bool
+solve (MetaVar _ mid subs) sp v = do
+  vsp <- mapM spine sp
+  let vars' = sequence (map toVar subs ++ map (toVar =<<) vsp)
+  case vars' of
+    Nothing -> return False
+    Just vars -> if allUnique vars then do
+      -- todo occurs check
+      sol <- quote v
+      e <- asks env
+      insertTermSol mid (Closure e $ bind vars sol)
+      return True
+    else
+      return False
+  where
+    spine :: MonadMEnv m => Spine -> m (Maybe Val)
+    spine (VApp s) = Just <$> force s
+    spine _ = return Nothing
+
+solveTy :: Tyck m => MetaVar Val -> TyVal -> m Bool
+solveTy (MetaVar _ mid subs) v = do
+  let vars' = mapM toVar subs
+  case vars' of
+    Nothing -> return False
+    Just vars -> if allUnique vars then do
+      -- todo occurs check
+      sol <- quoteTy v
+      e <- asks env
+      insertTypeSol mid (Closure e $ bind vars sol)
+      return True
+    else
+      return False
+
+
+-- Attempt to solve the equation, which either postpones it or
+-- splits into zero or more smaller equations, without recursively solving
+-- (unless it's straightforward to do so)
+attempt :: Tyck m => Equation -> m (Maybe [Equation])
+attempt (Left (th1, th2)) = do
+  t1 <- force th1
+  t2 <- force th2
+  conv t1 t2
+attempt (Right (ty1, ty2)) = convTy ty1 ty2
+
+-- The postponing logic
+unify :: Tyck m => [Equation] -> m ()
+unify [] = return ()
+unify (eq:eqs) = do
+  result <- attempt eq
+  case result of
+    Just eqs' -> do
+      menv <- get
+      put menv {
+        equations = []  -- todo filter only the relevant ones
+      }
+      unify (eqs' ++ eqs ++ equations menv)
+    Nothing -> do
+      -- ? use snoc list
+      modify \menv -> menv { equations = eq : equations menv }
+      unify eqs
 
 ----- Example monad to use functions ----
 type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))

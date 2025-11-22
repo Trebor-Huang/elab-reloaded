@@ -1,7 +1,7 @@
 module NbE (
-  Env, emptyEnv, MetaEnv(..), emptyMetaEnv,
+  Equation, Env, emptyEnv, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
-  Val(.. {- exclude VNeutral -}, VVar),
+  Val(.. {- exclude VNeutral -}, VVar), toVar,
   vApp, vFst, vSnd, vSuc, vNatElim,
   TyVal(..), Thunk (Thunk), force,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
@@ -19,14 +19,19 @@ import Unbound.Generics.LocallyNameless
 import Syntax
 import Utils
 
+type Equation = Either (Thunk, Thunk) (TyVal, TyVal)
+
 type Env = M.Map Var Val
 emptyEnv :: Env
 emptyEnv = M.empty
 data MetaEnv = MetaEnv {
   nextMVar :: Int,
-  solutions :: IM.IntMap (Closure [Var] Term) }
+  termSol :: IM.IntMap (Closure [Var] Term),
+  typeSol :: IM.IntMap (Closure [Var] Type),
+  equations :: [Equation]  -- postponed equations
+}
 emptyMetaEnv :: MetaEnv
-emptyMetaEnv = MetaEnv 0 IM.empty
+emptyMetaEnv = MetaEnv 0 IM.empty IM.empty []
 
 class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
 
@@ -41,6 +46,7 @@ force :: MonadMEnv m => Thunk -> m Val
 force (Thunk (VNeutral (Left m) sp)) = vMeta m sp
 force (Thunk a) = return a
 
+-- Eliminators
 data Spine
   = VApp {- -} Thunk
   | VFst {- -} | VSnd {- -}
@@ -50,18 +56,28 @@ data Spine
 
 data Val
   = VNeutral !(Either (MetaVar Val) Var) [Spine]
+  -- Constructors
   | VLam (Closure Var Term)
   | VPair Thunk Thunk
   | VZero | VSuc Int Thunk
   | VQuote TyVal
   deriving Show
 
+toVar :: Val -> Maybe Var
+toVar (VVar v) = return v
+toVar _ = Nothing
+
 data TyVal
-  = VSigma TyVal (Closure Var Type)
+  = VMTyVar (MetaVar Val)
+  | VEl Thunk
+    -- todo this should be VNeutral,
+    -- but none of the others would be type correct except VQuote
+    -- which we deal with
+  -- Type constructors
+  | VSigma TyVal (Closure Var Type)
   | VPi TyVal (Closure Var Type)
   | VNat
   | VUniverse
-  | VEl Thunk
   deriving Show
 
 -- Patterns for constructing values.
@@ -71,12 +87,20 @@ pattern VVar x = VNeutral (Right x) []
 
 vMeta :: MonadMEnv m => MetaVar Val -> [Spine] -> m Val
 vMeta m@(MetaVar _ mid subs) sp = do
-  sol <- gets (IM.lookup mid . solutions)
+  sol <- gets (IM.lookup mid . termSol)
   case sol of
     Just b -> do
       val <- b $$ (`zip'` subs)
       vSpine val sp
     Nothing -> return $ VNeutral (Left m) sp
+
+vMetaTy :: MonadMEnv m => MetaVar Val -> m TyVal
+vMetaTy m@(MetaVar _ mid subs) = do
+  sol <- gets (IM.lookup mid . typeSol)
+  case sol of
+    Just b -> do
+      b $$: (`zip'` subs)
+    Nothing -> return $ VMTyVar m
 
 vSpine :: MonadMEnv m => Val -> [Spine] -> m Val
 vSpine v [] = return v
@@ -157,6 +181,8 @@ eval env = \case
 
 evalTy :: MonadMEnv m => Env -> Type -> m TyVal
 evalTy env = \case
+  MTyVar (MetaVar name mid subs)
+    -> vMetaTy . MetaVar name mid =<< mapM (eval env) subs
   Sigma t1 t2 -> do
     v1 <- evalTy env t1
     return $ VSigma v1 (Closure env t2)
@@ -226,6 +252,8 @@ quote (VSuc k th) = do
 quote (VQuote ty) = Quote <$> quoteTy ty
 
 quoteTy :: MonadMEnv m => TyVal -> m Type
+quoteTy (VMTyVar (MetaVar name mid subs))
+  = MTyVar . MetaVar name mid <$> mapM quote subs
 quoteTy (VSigma vty c) = do
   ty <- quoteTy vty
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
