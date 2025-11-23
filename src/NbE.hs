@@ -52,7 +52,8 @@ data Spine
 -- There should be a TySpine in principle but it's just VEl by itself...
 
 data Val
-  = VNeutral !(Either (MetaVar Val) Var) [Spine]
+  = VFlex (MetaVar Val) [Spine]
+  | VRigid Var [Spine]
   -- Constructors
   | VLam (Closure Var Term)
   | VPair (Thunk Val) (Thunk Val)
@@ -76,7 +77,7 @@ data TyVal
 -- Patterns for constructing values.
 -- These should not look under metas, so they use "unthunk"
 pattern VVar :: Var -> Val
-pattern VVar x = VNeutral (Right x) []
+pattern VVar x = VRigid x []
 
 toVar :: Val -> Maybe Var
 toVar (VVar v) = Just v
@@ -89,7 +90,7 @@ vMeta m@(MetaVar _ mid subs) sp = do
     Just b -> do
       val <- b $$ (`zip'` subs)
       vSpine val sp
-    Nothing -> return $ VNeutral (Left m) sp
+    Nothing -> return $ VFlex m sp
 
 vMetaTy :: MonadMEnv m => MetaVar Val -> m TyVal
 vMetaTy m@(MetaVar _ mid subs) = do
@@ -114,16 +115,19 @@ vSpine v (c:sp) = case c of
 vApp :: MonadMEnv m => Val -> Val -> m Val
 vApp t u = case t of
   VLam t' -> t' $$ \x -> [(x, u)]
-  VNeutral v sp -> return $ VNeutral v (VApp (Thunk u) : sp)
+  VFlex mv sp -> return $ VFlex mv (VApp (Thunk u) : sp)
+  VRigid v sp -> return $ VRigid v (VApp (Thunk u) : sp)
   _ -> error "Impossible"
 
 vFst, vSnd, vSuc :: Val -> Val
 vFst (VPair t _) = unthunk t
-vFst (VNeutral v sp) = VNeutral v (VFst:sp)
+vFst (VFlex mv sp) = VFlex mv (VFst:sp)
+vFst (VRigid v sp) = VRigid v (VFst:sp)
 vFst _ = error "Impossible"
 
 vSnd (VPair _ t) = unthunk t
-vSnd (VNeutral v sp) = VNeutral v (VSnd:sp)
+vSnd (VFlex mv sp) = VFlex mv (VSnd:sp)
+vSnd (VRigid v sp) = VRigid v (VSnd:sp)
 vSnd _ = error "Impossible"
 
 vSuc (VSuc k v') = VSuc (k+1) v'
@@ -144,7 +148,8 @@ vNatElim m z s = \case
   VSuc k (Thunk v) -> do
     vrec <- vNatElim m z s v
     go k vrec
-  VNeutral v sp -> return $ VNeutral v (VNatElim m z s : sp)
+  VFlex mv sp -> return $ VFlex mv (VNatElim m z s : sp)
+  VRigid v sp -> return $ VRigid v (VNatElim m z s : sp)
   _ -> error "Impossible"
   where
     go 0 v = return v
@@ -152,9 +157,26 @@ vNatElim m z s = \case
       v' <- go (k-1) v
       s $$ \(n,r) -> [(n, VSuc k (Thunk VZero)), (r, v')]
 
+vSp :: MonadMEnv m => Spine -> Term -> m Term
+vSp s val = case s of
+  VApp thunk -> do
+    arg <- force thunk
+    App val <$> reify arg
+  VFst -> return $ Fst val
+  VSnd -> return $ Snd val
+  VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
+    (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
+    tym <- reifyTy vm
+    vz <- cz $$ \() -> []
+    tz <- reify vz
+    (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
+    ts <- reify vs
+    -- instead of (bind n tym), directly use cm
+    return $ NatElim (bind n tym) tz (bind p ts) val
+
 -- Looking up the metavariables if there is one, lazily
 force :: MonadMEnv m => Thunk Val -> m Val
-force (Thunk (VNeutral (Left m) sp)) = vMeta m sp
+force (Thunk (VFlex m sp)) = vMeta m sp
 force (Thunk a) = return a
 
 forceTy :: MonadMEnv m => Thunk TyVal -> m TyVal
@@ -220,28 +242,10 @@ t $$ r = snd <$> t $$+ r
 t $$: r = snd <$> t $$:+ r
 
 reify :: MonadMEnv m => Val -> m Term
-reify (VNeutral v sp) = do
-  v' <- case v of
-    Left (MetaVar name mid subs)
-      -> MVar . MetaVar name mid <$> mapM reify subs
-    Right v0 -> return $ Var v0
-  foldrM go v' sp
-  where
-    go s val = case s of
-      VApp thunk -> do
-        arg <- force thunk
-        App val <$> reify arg
-      VFst -> return $ Fst val
-      VSnd -> return $ Snd val
-      VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
-        (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
-        tym <- reifyTy vm
-        vz <- cz $$ \() -> []
-        tz <- reify vz
-        (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
-        ts <- reify vs
-        -- instead of (bind n tym), directly use cm
-        return $ NatElim (bind n tym) tz (bind p ts) val
+reify (VFlex (MetaVar name mid subs) sp) = do
+  v <- MVar . MetaVar name mid <$> mapM reify subs
+  foldrM vSp v sp
+reify (VRigid v sp) = foldrM vSp (Var v) sp
 
 reify (VLam c) = do
   (x, c') <- c $$+ \x -> [(x, VVar x)]

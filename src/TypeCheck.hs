@@ -286,15 +286,15 @@ convSp p q = throwError $ "Not convertible: " ++ show p ++ show q
 
 conv :: Tyck m => Val -> Val -> m (Maybe [Equation])
 -- rigid-rigid
-conv (VNeutral (Right v) sp) (VNeutral (Right v') sp') =
+conv (VRigid v sp) (VRigid v' sp') =
   if v == v' then
     Just <$> convSp sp sp'
   else
     throwError $ "Not convertible: " ++ show v ++ " /= " ++ show v'
 -- rigid-flex and flex-rigid
-conv (VNeutral (Left m) sp) v =
+conv (VFlex m sp) v =
   (\b -> if b then Just [] else Nothing) <$> solve m sp v
-conv v m@(VNeutral (Left _) _) = conv m v
+conv v m@VFlex {} = conv m v
 
 conv (VLam f) (VLam g) = do
   -- We can use a fresh variable, but that loses the name information
