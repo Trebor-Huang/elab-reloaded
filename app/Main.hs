@@ -37,10 +37,10 @@ ack = Lam $ bind x $ NatElim
 
 acks :: String
 acks = unlines [
-    "λx. elim(_. Nat -> Nat,",
+    "λx. elim(_. _ -> _,",
     "{- zero -}     λx. suc(x),",
     "{- suc -} x r. λx.",
-      "elim(_. Nat, r suc(zero), m s. r s, x),",
+      "elim(_. _, r suc(zero), m s. r s, x),",
     "x)"
   ]
 
@@ -57,14 +57,21 @@ idterm = RThe
   (RLam $ bind x $ RLam $ bind y $ RVar y)
 
 inferSuccess :: Raw -> (Term, Type)
-inferSuccess raw = let Right (tm, vty) = runTyckM $ infer raw in
-  (tm, runMetaEnvM $ quoteTy vty)
+inferSuccess raw =
+  let Right t = evalTyckM do
+                  (tm, vty) <- infer raw
+                  vty' <- forceTy vty
+                  ty <- quoteTy vty'
+                  return (tm, ty)
+  in t
 
 main :: IO ()
 main = do
   racc <- parseString acks
-  rty <- parseString ackty
-  let rterm = RApp (RApp (RThe rty racc) (rnum 3)) (rnum 2)
+  -- rty <- parseString ackty
+  let rterm = RApp (RApp racc (rnum 3)) (rnum 2)
+  -- print $ runTyckM $ infer rterm
+  putStrLn "Ready"
   let (tm, ty) = inferSuccess rterm
   print tm
   print ty

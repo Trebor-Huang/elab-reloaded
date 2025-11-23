@@ -3,7 +3,7 @@ module NbE (
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
   vApp, vFst, vSnd, vSuc, vNatElim,
-  TyVal(..), Thunk (Thunk), force,
+  TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
   quote, quoteTy, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
@@ -19,7 +19,7 @@ import Unbound.Generics.LocallyNameless
 import Syntax
 import Utils
 
-type Equation = Either (Thunk, Thunk) (TyVal, TyVal)
+type Equation = Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)
 
 type Env = M.Map Var Val
 emptyEnv :: Env
@@ -29,7 +29,7 @@ data MetaEnv = MetaEnv {
   termSol :: IM.IntMap (Closure [Var] Term),
   typeSol :: IM.IntMap (Closure [Var] Type),
   equations :: [Equation]  -- postponed equations
-}
+} deriving Show
 emptyMetaEnv :: MetaEnv
 emptyMetaEnv = MetaEnv 0 IM.empty IM.empty []
 
@@ -40,15 +40,12 @@ data Closure r t = Closure Env (Bind r t) deriving Show
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
 -- make the input type a Thunk. Generally always make the output Thunk.
-newtype Thunk = Thunk { unthunk :: Val } deriving Show
+newtype Thunk a = Thunk { unthunk :: a } deriving Show
 -- use unthunk to disregard this, and use force to make the update
-force :: MonadMEnv m => Thunk -> m Val
-force (Thunk (VNeutral (Left m) sp)) = vMeta m sp
-force (Thunk a) = return a
 
 -- Eliminators
 data Spine
-  = VApp {- -} Thunk
+  = VApp {- -} (Thunk Val)
   | VFst {- -} | VSnd {- -}
   | VNatElim (Closure Var Type) (Closure () Term) (Closure (Var, Var) Term) {- -}
   deriving Show
@@ -58,24 +55,20 @@ data Val
   = VNeutral !(Either (MetaVar Val) Var) [Spine]
   -- Constructors
   | VLam (Closure Var Term)
-  | VPair Thunk Thunk
-  | VZero | VSuc Int Thunk
-  | VQuote TyVal
+  | VPair (Thunk Val) (Thunk Val)
+  | VZero | VSuc Int (Thunk Val)
+  | VQuote (Thunk TyVal)
   deriving Show
-
-toVar :: Val -> Maybe Var
-toVar (VVar v) = return v
-toVar _ = Nothing
 
 data TyVal
   = VMTyVar (MetaVar Val)
-  | VEl Thunk
-    -- todo this should be VNeutral,
+  | VEl (Thunk Val)
+    -- this should be VTyNeutral,
     -- but none of the others would be type correct except VQuote
-    -- which we deal with
+    -- which we deal with manually
   -- Type constructors
-  | VSigma TyVal (Closure Var Type)
-  | VPi TyVal (Closure Var Type)
+  | VSigma (Thunk TyVal) (Closure Var Type)
+  | VPi (Thunk TyVal) (Closure Var Type)
   | VNat
   | VUniverse
   deriving Show
@@ -84,6 +77,10 @@ data TyVal
 -- These should not look under metas, so they use "unthunk"
 pattern VVar :: Var -> Val
 pattern VVar x = VNeutral (Right x) []
+
+toVar :: Val -> Maybe Var
+toVar (VVar v) = Just v
+toVar _ = Nothing
 
 vMeta :: MonadMEnv m => MetaVar Val -> [Spine] -> m Val
 vMeta m@(MetaVar _ mid subs) sp = do
@@ -133,7 +130,7 @@ vSuc (VSuc k v') = VSuc (k+1) v'
 vSuc v = VSuc 1 (Thunk v)
 
 vEl :: Val -> TyVal
-vEl (VQuote ty) = ty
+vEl (VQuote ty) = unthunk ty
 vEl v = VEl (Thunk v)
 
 vNatElim :: MonadMEnv m
@@ -154,6 +151,17 @@ vNatElim m z s = \case
     go k v = do
       v' <- go (k-1) v
       s $$ \(n,r) -> [(n, VSuc k (Thunk VZero)), (r, v')]
+
+-- Looking up the metavariables if there is one, lazily
+force :: MonadMEnv m => Thunk Val -> m Val
+force (Thunk (VNeutral (Left m) sp)) = vMeta m sp
+force (Thunk a) = return a
+
+forceTy :: MonadMEnv m => Thunk TyVal -> m TyVal
+forceTy (Thunk (VMTyVar m)) = vMetaTy m
+forceTy (Thunk a) = return a
+
+------ Normalization by evaluation ------
 
 eval :: MonadMEnv m => Env -> Term -> m Val
 eval env = \case
@@ -176,7 +184,7 @@ eval env = \case
   NatElim m z s t -> do
     v <- eval env t
     vNatElim (Closure env m) (Closure env (bind () z)) (Closure env s) v
-  Quote ty -> VQuote <$> evalTy env ty
+  Quote ty -> VQuote . Thunk <$> evalTy env ty
   The _ tm -> eval env tm
 
 evalTy :: MonadMEnv m => Env -> Type -> m TyVal
@@ -185,10 +193,10 @@ evalTy env = \case
     -> vMetaTy . MetaVar name mid =<< mapM (eval env) subs
   Sigma t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VSigma v1 (Closure env t2)
+    return $ VSigma (Thunk v1) (Closure env t2)
   Pi t1 t2 -> do
     v1 <- evalTy env t1
-    return $ VPi v1 (Closure env t2)
+    return $ VPi (Thunk v1) (Closure env t2)
   Nat -> return VNat
   Universe -> return VUniverse
   El t -> vEl <$> eval env t
@@ -249,17 +257,21 @@ quote (VSuc k th) = do
   v <- force th
   nTimes k Suc <$> quote v
 
-quote (VQuote ty) = Quote <$> quoteTy ty
+quote (VQuote thty) = do
+  vty <- forceTy thty
+  Quote <$> quoteTy vty
 
 quoteTy :: MonadMEnv m => TyVal -> m Type
 quoteTy (VMTyVar (MetaVar name mid subs))
   = MTyVar . MetaVar name mid <$> mapM quote subs
-quoteTy (VSigma vty c) = do
+quoteTy (VSigma thty c) = do
+  vty <- forceTy thty
   ty <- quoteTy vty
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
   t <- quoteTy c'
   return $ Sigma ty (bind x t)
-quoteTy (VPi vty c) = do
+quoteTy (VPi thty c) = do
+  vty <- forceTy thty
   ty <- quoteTy vty
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
   t <- quoteTy c'
