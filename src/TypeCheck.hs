@@ -8,7 +8,6 @@ import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless hiding (close)
-import qualified Data.Map as M
 import qualified Data.IntMap as IM
 import Data.Coerce (coerce)
 
@@ -18,22 +17,22 @@ import NbE
 import Utils
 
 data Context = Context {
-  env :: Env,  -- environment for evaluation
+  env :: !Env,  -- environment for evaluation
   vars :: [(RVar, Thunk TyVal)]  -- types of raw variables
 } deriving Show
 
 emptyContext :: Context
-emptyContext = Context M.empty []
+emptyContext = Context emptyEnv []
 
 newVar :: RVar -> Var -> Thunk TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
-  env = M.insert var (VVar var) (env ctx),
+  env = bindLocal [(var, VVar var)] (env ctx),
   vars = (vraw, ty) : vars ctx
 }
 
 bindEnv :: Var -> Val -> Context -> Context
 bindEnv var val ctx = ctx {
-  env = M.insert var val (env ctx)
+  env = bindLocal [(var, val)] (env ctx)
 }
 
 class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m

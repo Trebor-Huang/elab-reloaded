@@ -1,5 +1,6 @@
 module NbE (
-  Equation, Env, emptyEnv, MetaEnv(..), emptyMetaEnv,
+  Env(..), emptyEnv, bindLocal,
+  Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
   vApp, vFst, vSnd, vSuc, vNatElim, vSpine,
@@ -9,7 +10,6 @@ module NbE (
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
-import Data.Maybe (fromJust)
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import Control.Monad.State
@@ -18,22 +18,42 @@ import Unbound.Generics.LocallyNameless
 import Syntax
 import Utils
 
+--- Environment
+data Env = Env {
+  localEnv :: M.Map Var Val,
+  globalEnv :: ()
+} deriving Show
+
+emptyEnv :: Env
+emptyEnv = Env M.empty ()
+
+lookupLocal :: Env -> Var -> Val
+lookupLocal e v = case M.lookup v (localEnv e) of
+  Just val -> val
+  Nothing -> error "lookupLocal: impossible"
+
+bindLocal :: [(Var, Val)] -> Env -> Env
+bindLocal bds e = e {
+  localEnv = M.union (M.fromList bds) $ localEnv e
+}
+
+--- Metavariable environment
 type Equation = Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)
 
-type Env = M.Map Var Val
-emptyEnv :: Env
-emptyEnv = M.empty
 data MetaEnv = MetaEnv {
   nextMVar :: Int,
   termSol :: IM.IntMap (Closure [Var] Term),
   typeSol :: IM.IntMap (Closure [Var] Type),
   equations :: [Equation]  -- postponed equations
 } deriving Show
+
 emptyMetaEnv :: MetaEnv
 emptyMetaEnv = MetaEnv 0 IM.empty IM.empty []
 
 class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
 
+-- A closure stores an environment.
+-- TODO hide the constructor and implement pruning
 data Closure r t = Closure Env (Bind r t) deriving Show
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
@@ -162,7 +182,7 @@ forceTy (Thunk a) = return a
 
 eval :: MonadMEnv m => Env -> Term -> m Val
 eval env = \case
-  Var x -> return $ fromJust $ M.lookup x env
+  Var x -> return $ lookupLocal env x
   MVar (MetaVar name mid subs)
     -> vMeta [] . MetaVar name mid =<< mapM (eval env) subs
   Lam s -> return $ VLam $ Closure env s
@@ -203,7 +223,7 @@ evalTy env = \case
 ($$+) :: (MonadMEnv m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$+) (Closure env t) r = do
   (x, s) <- unbind t
-  s' <- eval (M.union (M.fromList (r x)) env) s
+  s' <- eval (bindLocal (r x) env) s
   return (x, s')
 
 ($$) :: (MonadMEnv f, Alpha a) => Closure a Term -> (a -> [(Var, Val)]) -> f Val
@@ -212,7 +232,7 @@ t $$ r = snd <$> t $$+ r
 ($$:+) :: (MonadMEnv m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (p, TyVal)
 ($$:+) (Closure env t) r = do
   (x, s) <- unbind t
-  s' <- evalTy (M.union (M.fromList (r x)) env) s
+  s' <- evalTy (bindLocal (r x) env) s
   return (x, s')
 
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
