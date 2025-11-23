@@ -10,7 +10,6 @@ module NbE (
 ) where
 
 import Data.Maybe (fromJust)
-import Data.Foldable (foldrM)
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import Control.Monad.State
@@ -83,34 +82,29 @@ toVar :: Val -> Maybe Var
 toVar (VVar v) = Just v
 toVar _ = Nothing
 
-vMeta :: MonadMEnv m => MetaVar Val -> [Spine] -> m Val
-vMeta m@(MetaVar _ mid subs) sp = do
+vMeta :: MonadMEnv m => [Spine] -> MetaVar Val -> m Val
+vMeta sp m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . termSol)
   case sol of
-    Just b -> do
-      val <- b $$ (`zip'` subs)
-      vSpine val sp
+    Just b -> vSpine sp =<< b $$ (`zip'` subs)
     Nothing -> return $ VFlex m sp
 
 vMetaTy :: MonadMEnv m => MetaVar Val -> m TyVal
 vMetaTy m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . typeSol)
   case sol of
-    Just b -> do
-      b $$: (`zip'` subs)
+    Just b -> b $$: (`zip'` subs)
     Nothing -> return $ VMTyVar m
 
-vSpine :: MonadMEnv m => Val -> [Spine] -> m Val
-vSpine v [] = return v
-vSpine v (c:sp) = case c of
-  VApp th -> do
-    v' <- vApp (unthunk th) v
-    vSpine v' sp
-  VFst -> vSpine (vFst v) sp
-  VSnd -> vSpine (vSnd v) sp
-  VNatElim m z s -> do
-    v' <- vNatElim m z s v
-    vSpine v' sp
+vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
+vSpine [] v = return v
+vSpine (c:sp) v0 = do
+  v <- vSpine sp v0
+  case c of
+    VApp th -> vApp (unthunk th) v
+    VFst -> return $ vFst v
+    VSnd -> return $ vSnd v
+    VNatElim m z s -> vNatElim m z s v
 
 vApp :: MonadMEnv m => Val -> Val -> m Val
 vApp t u = case t of
@@ -145,9 +139,7 @@ vNatElim :: MonadMEnv m
 vNatElim m z s = \case
   VZero -> z $$ \() -> []
   VSuc _ (Thunk (VSuc _ _)) -> error "Internal error: stacked VSuc"
-  VSuc k (Thunk v) -> do
-    vrec <- vNatElim m z s v
-    go k vrec
+  VSuc k (Thunk v) -> go k =<< vNatElim m z s v
   VFlex mv sp -> return $ VFlex mv (VNatElim m z s : sp)
   VRigid v sp -> return $ VRigid v (VNatElim m z s : sp)
   _ -> error "Impossible"
@@ -157,26 +149,9 @@ vNatElim m z s = \case
       v' <- go (k-1) v
       s $$ \(n,r) -> [(n, VSuc k (Thunk VZero)), (r, v')]
 
-vSp :: MonadMEnv m => Spine -> Term -> m Term
-vSp s val = case s of
-  VApp thunk -> do
-    arg <- force thunk
-    App val <$> reify arg
-  VFst -> return $ Fst val
-  VSnd -> return $ Snd val
-  VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
-    (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
-    tym <- reifyTy vm
-    vz <- cz $$ \() -> []
-    tz <- reify vz
-    (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
-    ts <- reify vs
-    -- instead of (bind n tym), directly use cm
-    return $ NatElim (bind n tym) tz (bind p ts) val
-
 -- Looking up the metavariables if there is one, lazily
 force :: MonadMEnv m => Thunk Val -> m Val
-force (Thunk (VFlex m sp)) = vMeta m sp
+force (Thunk (VFlex m sp)) = vMeta sp m
 force (Thunk a) = return a
 
 forceTy :: MonadMEnv m => Thunk TyVal -> m TyVal
@@ -189,7 +164,7 @@ eval :: MonadMEnv m => Env -> Term -> m Val
 eval env = \case
   Var x -> return $ fromJust $ M.lookup x env
   MVar (MetaVar name mid subs)
-    -> (`vMeta` []) . MetaVar name mid =<< mapM (eval env) subs
+    -> vMeta [] . MetaVar name mid =<< mapM (eval env) subs
   Lam s -> return $ VLam $ Closure env s
   App t1 t2 -> do
     v1 <- eval env t1
@@ -223,6 +198,8 @@ evalTy env = \case
   Universe -> return VUniverse
   El t -> vEl <$> eval env t
 
+-- Helpers for evaluating closures
+
 ($$+) :: (MonadMEnv m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (p, Val)
 ($$+) (Closure env t) r = do
   (x, s) <- unbind t
@@ -241,11 +218,30 @@ t $$ r = snd <$> t $$+ r
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
+reifySpine :: MonadMEnv m => [Spine] -> Term -> m Term
+reifySpine [] val = return val
+reifySpine (c:sp) val0 = do
+  val <- reifySpine sp val0
+  case c of
+    VApp thunk -> do
+      arg <- force thunk
+      App val <$> reify arg
+    VFst -> return $ Fst val
+    VSnd -> return $ Snd val
+    VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
+      (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
+      tym <- reifyTy vm
+      vz <- cz $$ \() -> []
+      tz <- reify vz
+      (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
+      ts <- reify vs
+      -- instead of (bind n tym), directly use cm
+      return $ NatElim (bind n tym) tz (bind p ts) val
+
 reify :: MonadMEnv m => Val -> m Term
-reify (VFlex (MetaVar name mid subs) sp) = do
-  v <- MVar . MetaVar name mid <$> mapM reify subs
-  foldrM vSp v sp
-reify (VRigid v sp) = foldrM vSp (Var v) sp
+reify (VFlex (MetaVar name mid subs) sp) =
+  reifySpine sp . MVar . MetaVar name mid =<< mapM reify subs
+reify (VRigid v sp) = reifySpine sp (Var v)
 
 reify (VLam c) = do
   (x, c') <- c $$+ \x -> [(x, VVar x)]
