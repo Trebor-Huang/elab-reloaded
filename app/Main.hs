@@ -38,15 +38,12 @@ ack = Lam $ bind x $ NatElim
 
 acks :: String
 acks = unlines [
-    "λx. elim(_. _ -> _,",
+    "λx. elim(_. _,",
     "{- zero -}     λx. suc(x),",
     "{- suc -} x r. λx.",
       "elim(_. _, r suc(zero), m s. r s, x),",
     "x)"
   ]
-
-ackty :: String
-ackty = "Nat -> Nat -> Nat"
 
 rnum :: Int -> Raw
 rnum 0 = RZero
@@ -69,7 +66,6 @@ inferSuccess raw = fromRight (error "Unsuccessful") $ evalTyckM do
 main :: IO ()
 main = do
   racc <- parseString acks
-  -- rty <- parseString ackty
   let rterm = RApp (RApp racc (rnum 3)) (rnum 2)
   -- print $ runTyckM $ infer rterm
   putStrLn "Ready"

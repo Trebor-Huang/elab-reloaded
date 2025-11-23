@@ -163,17 +163,18 @@ infer (RVar x) = do
 infer (RApp rfun rarg) = do
   (fun, thty) <- infer rfun
   ty <- forceTy thty
-  case ty of
+  (dom, cod) <- case ty of
     VPi thdom cod -> do
       dom <- forceTy thdom
-      arg <- check rarg dom
-      varg <- evalM arg
-      vcod <- cod $$: \y -> [(y, varg)]
-      return (App fun arg, Thunk vcod) -- TODO more lenient and solve stuff
-    _ -> throwError $ "Expected Pi type: " ++ show ty
+      return (dom, cod)
+    _ -> expectPiSigma True ty
+  arg <- check rarg dom
+  varg <- evalM arg
+  vcod <- cod $$: \y -> [(y, varg)]
+  return (App fun arg, Thunk vcod)
 infer (RLam f) = do
-  dom <- freshAnonMeta
-  vdom <- Thunk <$> evalTyM (MTyVar dom)
+  mdom <- freshAnonMeta
+  vdom <- Thunk <$> evalTyM (MTyVar mdom)
   (x, rt) <- unbind f
   let x' = coerce x :: Var
   (t, vcod) <- local (newVar x x' vdom) $ infer rt
@@ -188,17 +189,29 @@ infer (RFst r) = do
   ty <- forceTy th
   case ty of
     VSigma ty1 _ -> return (Fst t, ty1)
-    _ -> throwError "Expected Sigma type"
+    _ -> do
+      (ty1, _) <- expectPiSigma False ty
+      return (Fst t, Thunk ty1)
 infer (RSnd r) = do
   (t, th) <- infer r
   ty <- forceTy th
-  case ty of
-    VSigma _ ty2 -> do
-      varg <- evalM (Fst t)
-      sty2 <- ty2 $$: \y -> [(y, varg)]
-      return (Snd t, Thunk sty2)
-    _ -> throwError "Expected Sigma type"
-infer (RPair _ _) = throwError "Unable to infer type of pairs" -- todo
+  ty2 <- case ty of
+    VSigma _ ty2 -> return ty2
+    _ -> snd <$> expectPiSigma False ty
+  varg <- evalM (Fst t)
+  sty2 <- ty2 $$: \y -> [(y, varg)]
+  return (Snd t, Thunk sty2)
+infer (RPair t1 t2) = do
+  mt1 <- freshAnonMeta
+  ty1 <- evalTyM (MTyVar mt1)
+  z <- fresh (s2n "z")
+  bt2 <- local (bindEnv z (VVar z)) do
+    mt2 <- freshAnonMeta
+    evalTyM (MTyVar mt2)
+  ty2 <- closeTy z (Thunk bt2)
+  let ty = VSigma (Thunk ty1) ty2
+  t <- check (RPair t1 t2) ty
+  return (t, Thunk ty)
 infer rty@RSigma {} = do
   ty <- checkTy rty
   return (Quote ty, Thunk VUniverse)
@@ -235,6 +248,18 @@ infer RNat = return (Quote Nat, Thunk VUniverse)
 infer RUniverse = return (Quote Universe, Thunk VUniverse)
   -- todo add universe constraint (i.e. don't inline this)
 
+expectPiSigma :: Tyck m => Bool -> TyVal -> m (TyVal, Closure Var Type)
+expectPiSigma b ty = do
+  mdom <- freshAnonMeta
+  dom <- evalTyM (MTyVar mdom)
+  z <- fresh (s2n "z")
+  bcod <- local (bindEnv z (VVar z)) do
+    mcod <- freshAnonMeta
+    evalTyM (MTyVar mcod)
+  cod <- closeTy z (Thunk bcod)
+  unify [Right (Thunk ty,
+    Thunk $ (if b then VPi else VSigma) (Thunk dom) cod)]
+  return (dom, cod)
 
 ----- Unification algorithm -----
 -- the `conv` family of functions output Nothing when it should be postponed,
