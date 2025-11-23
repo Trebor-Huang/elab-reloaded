@@ -6,6 +6,8 @@ import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Control.Lens (anyOf)
 
+import Utils
+
 type Var = Name Term
 data MetaVar a = MetaVar
   {- suggested name -} !String
@@ -30,7 +32,7 @@ showTermM :: Int -> Term -> LFreshM ShowS
 showTermM i = \case
   Var x -> return (showsPrec i x)
   MVar (MetaVar name _ subs) ->
-    (\tms -> shows name . showList (map (\x -> x "") tms)) <$>
+    (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
   Lam t -> lunbind t \(x, t') -> do
     s <- showTermM 0 t'
@@ -96,7 +98,7 @@ occurs x = anyOf fv (== x)
 showTypeM :: Int -> Type -> LFreshM ShowS
 showTypeM i = \case
   MTyVar (MetaVar name _ subs) ->
-    (\tms -> shows name . showList (map (\x -> x "") tms)) <$>
+    (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
   Sigma t1 t2 -> do
     s1 <- showTypeM 0 t1

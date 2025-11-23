@@ -2,7 +2,7 @@ module NbE (
   Equation, Env, emptyEnv, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
-  vApp, vFst, vSnd, vSuc, vNatElim,
+  vApp, vFst, vSnd, vSuc, vNatElim, vSpine,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
   quote, quoteTy, nf,

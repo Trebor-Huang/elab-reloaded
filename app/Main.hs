@@ -7,6 +7,7 @@ import Raw
 import Syntax
 import NbE
 import TypeCheck
+import Data.Either (fromRight)
 
 x = s2n "x"
 y = s2n "y"
@@ -57,13 +58,13 @@ idterm = RThe
   (RLam $ bind x $ RLam $ bind y $ RVar y)
 
 inferSuccess :: Raw -> (Term, Type)
-inferSuccess raw =
-  let Right t = evalTyckM do
-                  (tm, vty) <- infer raw
-                  vty' <- forceTy vty
-                  ty <- quoteTy vty'
-                  return (tm, ty)
-  in t
+inferSuccess raw = fromRight (error "Unsuccessful") $ evalTyckM do
+  (tm, vty) <- infer raw
+  vty' <- forceTy vty
+  ty <- quoteTy vty'
+  ztm <- zonk tm
+  zty <- zonkTy ty
+  return (ztm, zty)
 
 main :: IO ()
 main = do

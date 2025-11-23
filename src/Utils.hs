@@ -13,3 +13,10 @@ zip' _ _ = error "zip': uneven lists"
 
 allUnique :: Ord a => [a] -> Bool
 allUnique = all ( (==) 1 . length) . group . sort
+
+showList__ :: (a -> ShowS) -> [a] -> ShowS
+showList__ _     []     s = "[]" ++ s
+showList__ showx (x:xs) s = '[' : showx x (showl xs)
+  where
+    showl []     = ']' : s
+    showl (y:ys) = ',' : showx y (showl ys)

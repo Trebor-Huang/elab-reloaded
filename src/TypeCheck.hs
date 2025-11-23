@@ -1,7 +1,8 @@
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 module TypeCheck (
   TyckM, runTyckM, evalTyckM, emptyContext,
-  check, checkTy, infer, conv, convTy
+  check, checkTy, infer, conv, convTy,
+  zonk, zonkTy
 ) where
 import Control.Monad.State
 import Control.Monad.Except
@@ -399,6 +400,68 @@ unify (eq:eqs) = do
       -- ? use snoc list
       modify \menv -> menv { equations = eq : equations menv }
       unify eqs
+
+-- Tools to substitute in the solutions and display the final results
+zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
+zonkMeta sol subs = do
+  vsubs <- mapM evalM subs
+  val <- sol $$ (`zip'` vsubs)
+  tm <- quote val
+  zonk tm
+
+zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
+zonkMetaTy sol subs = do
+  vsubs <- mapM evalM subs
+  val <- sol $$: (`zip'` vsubs)
+  quoteTy val
+
+zonk :: Tyck m => Term -> m Term
+zonk m@(MVar (MetaVar _ mid subs)) = do
+  sol <- gets (IM.lookup mid . termSol)
+  case sol of
+    Just s -> zonkMeta s subs
+    Nothing -> return m
+zonk (Var v) = return $ Var v
+zonk (Lam f) = do
+  (x, f') <- unbind f
+  zf <- local (bindEnv x (VVar x)) $ zonk f'
+  return $ Lam $ bind x zf
+zonk (App s t) = App <$> zonk s <*> zonk t
+zonk (Pair s t) = Pair <$> zonk s <*> zonk t
+zonk (Fst s) = Fst <$> zonk s
+zonk (Snd s) = Snd <$> zonk s
+zonk Zero = return Zero
+zonk (Suc s) = Suc <$> zonk s
+zonk (NatElim m z s c) = do
+  (x, m') <- unbind m
+  zm <- local (bindEnv x (VVar x)) $ zonkTy m'
+  zz <- zonk z
+  ((n, r), s') <- unbind s
+  zs <- local (bindEnv n (VVar n) . bindEnv r (VVar r)) $ zonk s'
+  zc <- zonk c
+  return $ NatElim (bind x zm) zz (bind (n, r) zs) zc
+zonk (Quote ty) = Quote <$> zonkTy ty
+zonk (The ty tm) = The <$> zonkTy ty <*> zonk tm
+
+zonkTy :: Tyck m => Type -> m Type
+zonkTy m@(MTyVar (MetaVar _ mid subs)) = do
+  sol <- gets (IM.lookup mid . typeSol)
+  case sol of
+    Just s -> zonkMetaTy s subs
+    Nothing -> return m
+zonkTy (Sigma ty f) = do
+  zty <- zonkTy ty
+  (x, f') <- unbind f
+  zf <- local (bindEnv x (VVar x)) $ zonkTy f'
+  return $ Sigma zty $ bind x zf
+zonkTy (Pi ty f) = do
+  zty <- zonkTy ty
+  (x, f') <- unbind f
+  zf <- local (bindEnv x (VVar x)) $ zonkTy f'
+  return $ Pi zty $ bind x zf
+zonkTy Nat = return Nat
+zonkTy Universe = return Universe
+zonkTy (El tm) = El <$> zonk tm
 
 ----- Example monad to use functions ----
 type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
