@@ -5,7 +5,7 @@ module NbE (
   vApp, vFst, vSnd, vSuc, vNatElim, vSpine,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  quote, quoteTy, nf,
+  reify, reifyTy, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
@@ -219,68 +219,68 @@ t $$ r = snd <$> t $$+ r
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
-quote :: MonadMEnv m => Val -> m Term
-quote (VNeutral v sp) = do
+reify :: MonadMEnv m => Val -> m Term
+reify (VNeutral v sp) = do
   v' <- case v of
     Left (MetaVar name mid subs)
-      -> MVar . MetaVar name mid <$> mapM quote subs
+      -> MVar . MetaVar name mid <$> mapM reify subs
     Right v0 -> return $ Var v0
   foldrM go v' sp
   where
     go s val = case s of
       VApp thunk -> do
         arg <- force thunk
-        App val <$> quote arg
+        App val <$> reify arg
       VFst -> return $ Fst val
       VSnd -> return $ Snd val
       VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
         (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
-        tym <- quoteTy vm
+        tym <- reifyTy vm
         vz <- cz $$ \() -> []
-        tz <- quote vz
+        tz <- reify vz
         (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
-        ts <- quote vs
+        ts <- reify vs
         -- instead of (bind n tym), directly use cm
         return $ NatElim (bind n tym) tz (bind p ts) val
 
-quote (VLam c) = do
+reify (VLam c) = do
   (x, c') <- c $$+ \x -> [(x, VVar x)]
-  t <- quote c'
+  t <- reify c'
   return $ Lam (bind x t)
-quote (VPair th1 th2) = do
+reify (VPair th1 th2) = do
   v1 <- force th1
   v2 <- force th2
-  Pair <$> quote v1 <*> quote v2
+  Pair <$> reify v1 <*> reify v2
 
-quote VZero = return Zero
-quote (VSuc k th) = do
+reify VZero = return Zero
+reify (VSuc k th) = do
   v <- force th
-  nTimes k Suc <$> quote v
+  nTimes k Suc <$> reify v
 
-quote (VQuote thty) = do
+reify (VQuote thty) = do
   vty <- forceTy thty
-  Quote <$> quoteTy vty
+  Quote <$> reifyTy vty
 
-quoteTy :: MonadMEnv m => TyVal -> m Type
-quoteTy (VMTyVar (MetaVar name mid subs))
-  = MTyVar . MetaVar name mid <$> mapM quote subs
-quoteTy (VSigma thty c) = do
+reifyTy :: MonadMEnv m => TyVal -> m Type
+reifyTy (VMTyVar (MetaVar name mid subs))
+  = MTyVar . MetaVar name mid <$> mapM reify subs
+reifyTy (VSigma thty c) = do
   vty <- forceTy thty
-  ty <- quoteTy vty
+  ty <- reifyTy vty
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- quoteTy c'
+  t <- reifyTy c'
   return $ Sigma ty (bind x t)
-quoteTy (VPi thty c) = do
+reifyTy (VPi thty c) = do
   vty <- forceTy thty
-  ty <- quoteTy vty
+  ty <- reifyTy vty
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- quoteTy c'
+  t <- reifyTy c'
   return $ Pi ty (bind x t)
-quoteTy VNat = return Nat
-quoteTy VUniverse = return Universe
-quoteTy (VEl th) = do
+reifyTy VNat = return Nat
+reifyTy VUniverse = return Universe
+reifyTy (VEl th) = do
   t <- force th
-  El <$> quote t
+  El <$> reify t
 
 ---- Example monad to use the functions ----
 type MetaEnvM = StateT MetaEnv FreshM
@@ -291,4 +291,4 @@ runMetaEnvM m = runFreshM (evalStateT m emptyMetaEnv)
 nf :: Env -> Term -> Term
 nf env t = runMetaEnvM $ do
   v <- eval env t
-  quote v
+  reify v

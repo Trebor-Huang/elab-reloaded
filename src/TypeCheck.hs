@@ -80,14 +80,14 @@ insertTypeSol i s = do
 close :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 close a th = do
   t <- force th
-  tm <- quote t
+  tm <- reify t
   e <- asks env
   return (Closure e (bind a tm))
 
 closeTy :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
 closeTy a th = do
   t <- forceTy th
-  ty <- quoteTy t
+  ty <- reifyTy t
   e <- asks env
   return (Closure e (bind a ty))
 
@@ -388,7 +388,7 @@ solveTy (MetaVar _ mid subs) v = do
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo occurs check
-      sol <- quoteTy v
+      sol <- reifyTy v
       e <- asks env
       insertTypeSol mid (Closure e $ bind vars sol)
       return True
@@ -431,14 +431,14 @@ zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
 zonkMeta sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$ (`zip'` vsubs)
-  tm <- quote val
+  tm <- reify val
   zonk tm
 
 zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
 zonkMetaTy sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$: (`zip'` vsubs)
-  quoteTy val
+  reifyTy val
 
 zonk :: Tyck m => Term -> m Term
 zonk m@(MVar (MetaVar _ mid subs)) = do
