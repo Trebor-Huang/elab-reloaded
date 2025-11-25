@@ -1,0 +1,13 @@
+postulate
+  A : U ; x y : A |- Id : U
+
+define
+  |- ack : Nat -> Nat -> Nat
+  = λx. elim(_. _,
+    {- zero -}     λx. suc(x),
+    {- suc -} x r. λx.
+      elim(_. _, r suc(zero), m s. r s, x),
+    x)
+
+eval
+  ack() 3 4

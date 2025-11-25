@@ -1,25 +1,33 @@
 module NbE (
-  GlobalEntry, Env(..), emptyEnv, bindLocal, lookupLocal, bindGlobal, lookupGlobal,
+  GlobalEntry(..), Env(..), emptyEnv, bindLocal, lookupLocal, bindGlobal, lookupGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
   vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vTop,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  Unfold, reify, reifyTy, reifySpine, nf,
+  Unfold(..), reify, reifyTy, reifySpine, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import Control.Monad.State
+import GHC.Generics
 import Unbound.Generics.LocallyNameless
 
 import Syntax
 import Utils
 
 --- Environment
-type GlobalEntry = (Maybe (Closure [Var] Term), Closure [Var] Type)
+data GlobalEntry
+  = Definition Type Term
+  | Postulate Type
+  | Hypothetic Type (Bind Var GlobalEntry)
+  -- Global definitions can't be closures
+  deriving (Generic, Show)
+instance Alpha GlobalEntry
+
 data Env = Env {
   localEnv :: M.Map Var Val,
   globalEnv :: M.Map String GlobalEntry
@@ -131,9 +139,18 @@ vMetaTy m@(MetaVar _ mid subs) = do
 
 vTop :: MonadMEnv m => Env -> [Spine] -> Const Val -> m Val
 vTop env sp c@(Const name subs) = do
-  case fst $ lookupGlobal env name of
-    Just b -> VTop c sp . Just . Thunk <$> (vSpine sp =<< b $$ (`zip'` subs))
+  result <- go env (lookupGlobal env name) subs
+  case result of
+    Just th -> VTop c sp . Just . Thunk <$> vSpine sp (unthunk th)
     Nothing -> return $ VTop c sp Nothing
+  where
+    go :: MonadMEnv m => Env -> GlobalEntry -> [Val] -> m (Maybe (Thunk Val))
+    go env (Hypothetic _ bg) (v:subs) = do
+      (x, g) <- unbind bg
+      go (bindLocal [(x, v)] env) g subs
+    go env (Definition _ tm) [] = Just . Thunk <$> eval env tm
+    go _ (Postulate _) [] = return Nothing
+    go _ _ _ = error "Impossible"
 
 vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
 vSpine [] v = return v
@@ -266,7 +283,7 @@ t $$ r = snd <$> t $$+ r
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
-type Unfold = Bool
+data Unfold = NoUnfold | UnfoldMeta | UnfoldDef deriving (Eq, Show)
 
 reifySpine :: MonadMEnv m => Unfold -> [Spine] -> Term -> m Term
 reifySpine _ [] val = return val
@@ -289,13 +306,14 @@ reifySpine b (c:sp) val0 = do
 reify :: MonadMEnv m => Unfold -> Val -> m Term
 reify b (VRigid v sp) = reifySpine b sp (Var v)
 
-reify b (VFlex (MetaVar name mid subs) sp) =
-  reifySpine b sp . MVar . MetaVar name mid =<< mapM (reify b) subs
-  -- unfold meta?
+reify b (VFlex m@(MetaVar name mid subs) sp) =
+  case b of
+    NoUnfold -> reifySpine b sp . MVar . MetaVar name mid =<< mapM (reify b) subs
+    _ -> reify b =<< vMeta sp m
 
 reify b (VTop (Const name subs) sp mval) =
   case (b, mval) of
-    (True, Just val) -> reifySpine True sp =<< reify True (unthunk val)
+    (UnfoldDef, Just val) -> reify b (unthunk val)
     _ -> reifySpine b sp . Top . Const name =<< mapM (reify b) subs
 
 reify b (VLam c) = do
@@ -336,4 +354,4 @@ runMetaEnvM m = runFreshM (evalStateT m emptyMetaEnv)
 nf :: Env -> Term -> Term
 nf env t = runMetaEnvM $ do
   v <- eval env t
-  reify False v
+  reify UnfoldDef v

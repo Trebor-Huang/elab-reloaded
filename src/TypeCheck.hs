@@ -2,13 +2,14 @@
 module TypeCheck (
   TyckM, runTyckM, evalTyckM, emptyContext,
   check, checkTy, infer, conv, convTy,
-  zonk, zonkTy
+  zonk, zonkTy, processFile
 ) where
 import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless hiding (close)
 import qualified Data.IntMap as IM
+import qualified Data.Map as M
 import Data.Coerce (coerce)
 
 import Raw
@@ -85,14 +86,14 @@ insertTypeSol i s = do
 close :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 close a th = do
   t <- force th
-  tm <- reify False t
+  tm <- reify NoUnfold t
   e <- asks env
   return (Closure e (bind a tm))
 
 closeTy :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
 closeTy a th = do
   t <- forceTy th
-  ty <- reifyTy False t
+  ty <- reifyTy NoUnfold t
   e <- asks env
   return (Closure e (bind a ty))
 
@@ -142,9 +143,24 @@ checkTy (RSigma rty1 rc) = do
 checkTy RNat = return Nat
 checkTy RUniverse = return Universe
 checkTy RHole = MTyVar <$> freshAnonMeta
-checkTy rtm = do
-  tm' <- check rtm VUniverse
-  return (El tm')
+checkTy rtm = El <$> check rtm VUniverse
+
+checkJudgment :: Tyck m => RawJudgment -> m GlobalEntry
+checkJudgment (Judge rty mtm) = do
+  ty <- checkTy rty
+  case mtm of
+    Nothing -> return $ Postulate ty
+    Just rtm -> do
+      vty <- evalTyM ty
+      tm <- check rtm vty
+      return $ Definition ty tm
+checkJudgment (Hypo rty bj) = do
+  ty <- checkTy rty
+  vty <- evalTyM ty
+  (x, j) <- unbind bj
+  let x' = coerce x' :: Var
+  entry <- local (newVar x x' (Thunk vty)) $ checkJudgment j
+  return $ Hypothetic ty $ bind x' entry
 
 infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
 infer RHole = do -- todo typed holes
@@ -153,7 +169,31 @@ infer RHole = do -- todo typed holes
   vty <- evalTyM (MTyVar mty)
   return (MVar m, Thunk vty)
 
--- infer toplevel
+infer (RConst name args) = do
+  ge <- asks (globalEnv . env)
+  case M.lookup name ge of
+    Nothing -> error "Impossible: constant not found"
+    Just entry -> do
+      (targs, ty) <- go entry args
+      return (Top (Const name targs), ty)
+  where
+    go :: Tyck m => GlobalEntry -> [Raw] -> m ([Term], Thunk TyVal)
+    -- check arguments
+    go (Hypothetic ty bentry) (rtm:rtms) = do
+      vty <- evalTyM ty
+      tm <- check rtm vty
+      (x, entry) <- unbind bentry
+      vtm <- evalM tm
+      (tms, thty) <- local (bindEnv x vtm) $ go entry rtms
+      return (tm:tms, thty)
+    -- substitute to get type
+    go (Definition ty _) [] = do
+      vty <- evalTyM ty
+      return ([], Thunk vty)
+    go (Postulate ty) [] = do
+      vty <- evalTyM ty
+      return ([], Thunk vty)
+    go _ _ = throwError "Wrong number of arguments"
 
 infer (RThe rty rtm) = do
   ty <- checkTy rty
@@ -267,29 +307,6 @@ expectPiSigma b ty = do
   unify [Right (Thunk ty,
     Thunk $ (if b then VPi else VSigma) (Thunk dom) cod)]
   return (dom, cod)
-
-checkTelescope :: Tyck m => [(RVar, Raw)] -> m a -> m a
-checkTelescope [] cont = cont
-checkTelescope ((rv, rty):tel) cont = do
-  let v = coerce rv :: Var
-  ty <- checkTy rty
-  vty <- evalTyM ty
-  local (newVar rv v (Thunk vty)) $ checkTelescope tel cont
-
-checkTop :: Tyck m => String -> [(RVar, Raw)] -> Raw -> Maybe Raw -> m a -> m a
-checkTop name tel rty mtm cont = do
-  let vars = coerce (map fst tel) :: [Var]
-  (tm, ty) <- checkTelescope tel $ do
-    ty <- checkTy rty
-    case mtm of
-      Nothing -> return (Nothing, ty)
-      Just rtm -> do
-        vty <- evalTyM ty
-        tm <- check rtm vty
-        return (Just tm, ty)
-  e <- asks env
-  local (declareConst name
-    (Closure e . bind vars <$> tm, Closure e $ bind vars ty)) cont
 
 ----- Unification algorithm -----
 -- the `conv` family of functions output Nothing when it should be postponed,
@@ -418,7 +435,7 @@ solveTy (MetaVar _ mid subs) v = do
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo occurs check
-      sol <- reifyTy False v
+      sol <- reifyTy NoUnfold v
       e <- asks env
       insertTypeSol mid (Closure e $ bind vars sol)
       return True
@@ -456,19 +473,18 @@ unify (eq:eqs) = do
       modify \menv -> menv { equations = eq : equations menv }
       unify eqs
 
--- Tools to substitute in the solutions and display the final results
+-- Substitute in the metas given a term, without normalizing first
 zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
 zonkMeta sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$ (`zip'` vsubs)
-  tm <- reify False val
-  zonk tm
+  reify UnfoldMeta val
 
 zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
 zonkMetaTy sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$: (`zip'` vsubs)
-  reifyTy False val
+  reifyTy UnfoldMeta val
 
 zonk :: Tyck m => Term -> m Term
 zonk (MVar (MetaVar name mid subs)) = do
@@ -518,6 +534,18 @@ zonkTy (Pi ty f) = do
 zonkTy Nat = return Nat
 zonkTy Universe = return Universe
 zonkTy (El tm) = El <$> zonk tm
+
+---- Processing whole files ----
+processFile :: Tyck m => [(RawJudgment, String)] -> Raw -> m (Type, Term, Term)
+processFile [] expr = do
+  (tm, vty) <- infer expr
+  ty <- reifyTy UnfoldMeta =<< forceTy vty
+  vtm <- evalM tm
+  ntm <- reify UnfoldDef vtm
+  return (ty, tm, ntm)
+processFile ((rj,name):decl) expr = do
+  j <- checkJudgment rj
+  local (declareConst name j) $ processFile decl expr
 
 ----- Example monad to use functions ----
 type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
