@@ -1,5 +1,6 @@
 module Syntax (
-  Var, MetaVar(..), Term(..), Type(..),
+  Var, MetaVar(..), Const(..),
+  Term(..), Type(..),
   nfSubst
 ) where
 import Unbound.Generics.LocallyNameless
@@ -13,9 +14,10 @@ data MetaVar a = MetaVar
   {- suggested name -} !String
   {- metavar id -} !Int
   {- stuck substitution -} [a] deriving (Show, Generic)
+data Const a = Const !String [a] deriving (Show, Generic)
 
 data Term
-  = Var Var | MVar (MetaVar Term)
+  = Var Var | MVar (MetaVar Term) | Top (Const Term)
   | Lam (Bind Var Term) | App Term Term
   | Pair Term Term | Fst Term | Snd Term
   | Zero | Suc Term
@@ -32,6 +34,9 @@ showTermM :: Int -> Term -> LFreshM ShowS
 showTermM i = \case
   Var x -> return (showsPrec i x)
   MVar (MetaVar name _ subs) ->
+    (\tms -> showString name . showList__ id tms) <$>
+    mapM (showTermM 0) subs
+  Top (Const name subs) ->
     (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
   Lam t -> lunbind t \(x, t') -> do
@@ -129,6 +134,7 @@ instance Show Type where
   showsPrec i t = runLFreshM (showTypeM i t)
 
 instance Alpha a => Alpha (MetaVar a)
+instance Alpha a => Alpha (Const a)
 instance Alpha Term
 instance Alpha Type
 
@@ -139,12 +145,14 @@ instance Subst Term Term where
 instance Subst Term Type
 
 instance Subst Term (MetaVar Term)
+instance Subst Term (Const Term)
 
 ----- Substitution based normalization -----
 substnf :: Term -> FreshM Term
 substnf (Var x) = return $ Var x
 substnf (MVar (MetaVar name mid subs))
   = MVar . MetaVar name mid <$> mapM substnf subs
+substnf Top {} = error "I can't do this"
 substnf (Lam t) = do
   (y, t') <- unbind t
   Lam . bind y <$> substnf t'

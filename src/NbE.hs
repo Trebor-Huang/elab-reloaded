@@ -1,12 +1,12 @@
 module NbE (
-  Env(..), emptyEnv, bindLocal,
+  Env(..), emptyEnv, bindLocal, lookupLocal, bindGlobal, lookupGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
-  vApp, vFst, vSnd, vSuc, vNatElim, vSpine,
+  vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vTop,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  reify, reifyTy, nf,
+  Unfold, reify, reifyTy, reifySpine, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
@@ -21,11 +21,11 @@ import Utils
 --- Environment
 data Env = Env {
   localEnv :: M.Map Var Val,
-  globalEnv :: ()
+  globalEnv :: M.Map String (Maybe (Closure [Var] Term))
 } deriving Show
 
 emptyEnv :: Env
-emptyEnv = Env M.empty ()
+emptyEnv = Env M.empty M.empty
 
 lookupLocal :: Env -> Var -> Val
 lookupLocal e v = case M.lookup v (localEnv e) of
@@ -35,6 +35,16 @@ lookupLocal e v = case M.lookup v (localEnv e) of
 bindLocal :: [(Var, Val)] -> Env -> Env
 bindLocal bds e = e {
   localEnv = M.union (M.fromList bds) $ localEnv e
+}
+
+lookupGlobal :: Env -> String -> Maybe (Closure [Var] Term)
+lookupGlobal e v = case M.lookup v (globalEnv e) of
+  Just val -> val
+  Nothing -> error $ "lookupGlobal: unknown constant " ++ v
+
+bindGlobal :: String -> Maybe (Closure [Var] Term) -> Env -> Env
+bindGlobal n v e = e {
+  globalEnv = M.insert n v $ globalEnv e
 }
 
 --- Metavariable environment
@@ -73,6 +83,8 @@ data Spine
 data Val
   = VFlex (MetaVar Val) [Spine]
   | VRigid Var [Spine]
+  | VTop (Const Val) [Spine] !(Maybe (Thunk Val))
+    -- the thunk should be lazy, but the Maybe should be strict
   -- Constructors
   | VLam (Closure Var Term)
   | VPair (Thunk Val) (Thunk Val)
@@ -116,6 +128,12 @@ vMetaTy m@(MetaVar _ mid subs) = do
     Just b -> b $$: (`zip'` subs)
     Nothing -> return $ VMTyVar m
 
+vTop :: MonadMEnv m => Env -> [Spine] -> Const Val -> m Val
+vTop env sp c@(Const name subs) = do
+  case lookupGlobal env name of
+    Just b -> VTop c sp . Just . Thunk <$> (vSpine sp =<< b $$ (`zip'` subs))
+    Nothing -> return $ VTop c sp Nothing
+
 vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
 vSpine [] v = return v
 vSpine (c:sp) v0 = do
@@ -131,17 +149,23 @@ vApp t u = case t of
   VLam t' -> t' $$ \x -> [(x, u)]
   VFlex mv sp -> return $ VFlex mv (VApp (Thunk u) : sp)
   VRigid v sp -> return $ VRigid v (VApp (Thunk u) : sp)
+  VTop c sp v -> VTop c (VApp (Thunk u) : sp) <$>
+    case v of
+      Just th -> Just . Thunk <$> vApp (unthunk th) u
+      Nothing -> return Nothing
   _ -> error "Impossible"
 
 vFst, vSnd, vSuc :: Val -> Val
 vFst (VPair t _) = unthunk t
 vFst (VFlex mv sp) = VFlex mv (VFst:sp)
 vFst (VRigid v sp) = VRigid v (VFst:sp)
+vFst (VTop c sp v) = VTop c (VFst:sp) $ Thunk . vFst . unthunk <$> v
 vFst _ = error "Impossible"
 
 vSnd (VPair _ t) = unthunk t
 vSnd (VFlex mv sp) = VFlex mv (VSnd:sp)
 vSnd (VRigid v sp) = VRigid v (VSnd:sp)
+vSnd (VTop c sp v) = VTop c (VSnd:sp) $ Thunk . vSnd . unthunk <$> v
 vSnd _ = error "Impossible"
 
 vSuc (VSuc k v') = VSuc (k+1) v'
@@ -172,6 +196,7 @@ vNatElim m z s = \case
 -- Looking up the metavariables if there is one, lazily
 force :: MonadMEnv m => Thunk Val -> m Val
 force (Thunk (VFlex m sp)) = vMeta sp m
+force (Thunk (VTop _ _ (Just val))) = force val
 force (Thunk a) = return a
 
 forceTy :: MonadMEnv m => Thunk TyVal -> m TyVal
@@ -185,6 +210,8 @@ eval env = \case
   Var x -> return $ lookupLocal env x
   MVar (MetaVar name mid subs)
     -> vMeta [] . MetaVar name mid =<< mapM (eval env) subs
+  Top (Const name subs)
+    -> vTop env [] . Const name =<< mapM (eval env) subs
   Lam s -> return $ VLam $ Closure env s
   App t1 t2 -> do
     v1 <- eval env t1
@@ -238,69 +265,65 @@ t $$ r = snd <$> t $$+ r
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
-reifySpine :: MonadMEnv m => [Spine] -> Term -> m Term
-reifySpine [] val = return val
-reifySpine (c:sp) val0 = do
-  val <- reifySpine sp val0
+type Unfold = Bool
+
+reifySpine :: MonadMEnv m => Unfold -> [Spine] -> Term -> m Term
+reifySpine _ [] val = return val
+reifySpine b (c:sp) val0 = do
+  val <- reifySpine b sp val0
   case c of
-    VApp thunk -> do
-      arg <- force thunk
-      App val <$> reify arg
+    VApp thunk -> App val <$> reify b (unthunk thunk)
     VFst -> return $ Fst val
     VSnd -> return $ Snd val
     VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
       (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
-      tym <- reifyTy vm
+      tym <- reifyTy b vm
       vz <- cz $$ \() -> []
-      tz <- reify vz
+      tz <- reify b vz
       (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
-      ts <- reify vs
+      ts <- reify b vs
       -- instead of (bind n tym), directly use cm
       return $ NatElim (bind n tym) tz (bind p ts) val
 
-reify :: MonadMEnv m => Val -> m Term
-reify (VFlex (MetaVar name mid subs) sp) =
-  reifySpine sp . MVar . MetaVar name mid =<< mapM reify subs
-reify (VRigid v sp) = reifySpine sp (Var v)
+reify :: MonadMEnv m => Unfold -> Val -> m Term
+reify b (VRigid v sp) = reifySpine b sp (Var v)
 
-reify (VLam c) = do
+reify b (VFlex (MetaVar name mid subs) sp) =
+  reifySpine b sp . MVar . MetaVar name mid =<< mapM (reify b) subs
+-- Axiomatized constants, skip
+reify b (VTop (Const name subs) sp mval) =
+  case (b, mval) of
+    (True, Just val) -> reifySpine True sp =<< reify True (unthunk val)
+    _ -> reifySpine b sp . Top . Const name =<< mapM (reify b) subs
+
+reify b (VLam c) = do
   (x, c') <- c $$+ \x -> [(x, VVar x)]
-  t <- reify c'
+  t <- reify b c'
   return $ Lam (bind x t)
-reify (VPair th1 th2) = do
-  v1 <- force th1
-  v2 <- force th2
-  Pair <$> reify v1 <*> reify v2
+reify b (VPair th1 th2) =
+  Pair <$> reify b (unthunk th1) <*> reify b (unthunk th2)
 
-reify VZero = return Zero
-reify (VSuc k th) = do
-  v <- force th
-  nTimes k Suc <$> reify v
+reify _ VZero = return Zero
+reify b (VSuc k th) = nTimes k Suc <$> reify b (unthunk th)
 
-reify (VQuote thty) = do
-  vty <- forceTy thty
-  Quote <$> reifyTy vty
+reify b (VQuote thty) = Quote <$> reifyTy b (unthunk thty)
 
-reifyTy :: MonadMEnv m => TyVal -> m Type
-reifyTy (VMTyVar (MetaVar name mid subs))
-  = MTyVar . MetaVar name mid <$> mapM reify subs
-reifyTy (VSigma thty c) = do
-  vty <- forceTy thty
-  ty <- reifyTy vty
+reifyTy :: MonadMEnv m => Unfold -> TyVal -> m Type
+reifyTy b (VMTyVar (MetaVar name mid subs))
+  = MTyVar . MetaVar name mid <$> mapM (reify b) subs
+reifyTy b (VSigma thty c) = do
+  ty <- reifyTy b (unthunk thty)
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- reifyTy c'
+  t <- reifyTy b c'
   return $ Sigma ty (bind x t)
-reifyTy (VPi thty c) = do
-  vty <- forceTy thty
-  ty <- reifyTy vty
+reifyTy b (VPi thty c) = do
+  ty <- reifyTy b (unthunk thty)
   (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- reifyTy c'
+  t <- reifyTy b c'
   return $ Pi ty (bind x t)
-reifyTy VNat = return Nat
-reifyTy VUniverse = return Universe
-reifyTy (VEl th) = do
-  t <- force th
-  El <$> reify t
+reifyTy _ VNat = return Nat
+reifyTy _ VUniverse = return Universe
+reifyTy b (VEl th) = El <$> reify b (unthunk th)
 
 ---- Example monad to use the functions ----
 type MetaEnvM = StateT MetaEnv FreshM
@@ -311,4 +334,4 @@ runMetaEnvM m = runFreshM (evalStateT m emptyMetaEnv)
 nf :: Env -> Term -> Term
 nf env t = runMetaEnvM $ do
   v <- eval env t
-  reify v
+  reify False v

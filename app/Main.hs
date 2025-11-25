@@ -58,7 +58,7 @@ inferSuccess :: Raw -> (Term, Type)
 inferSuccess raw = fromRight (error "Unsuccessful") $ evalTyckM do
   (tm, vty) <- infer raw
   vty' <- forceTy vty
-  ty <- reifyTy vty'
+  ty <- reifyTy False vty'
   ztm <- zonk tm
   zty <- zonkTy ty
   return (ztm, zty)
