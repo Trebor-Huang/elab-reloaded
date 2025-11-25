@@ -1,5 +1,5 @@
 module NbE (
-  Env(..), emptyEnv, bindLocal, lookupLocal, bindGlobal, lookupGlobal,
+  GlobalEntry, Env(..), emptyEnv, bindLocal, lookupLocal, bindGlobal, lookupGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
@@ -19,9 +19,10 @@ import Syntax
 import Utils
 
 --- Environment
+type GlobalEntry = (Maybe (Closure [Var] Term), Closure [Var] Type)
 data Env = Env {
   localEnv :: M.Map Var Val,
-  globalEnv :: M.Map String (Maybe (Closure [Var] Term))
+  globalEnv :: M.Map String GlobalEntry
 } deriving Show
 
 emptyEnv :: Env
@@ -37,12 +38,12 @@ bindLocal bds e = e {
   localEnv = M.union (M.fromList bds) $ localEnv e
 }
 
-lookupGlobal :: Env -> String -> Maybe (Closure [Var] Term)
+lookupGlobal :: Env -> String -> GlobalEntry
 lookupGlobal e v = case M.lookup v (globalEnv e) of
   Just val -> val
   Nothing -> error $ "lookupGlobal: unknown constant " ++ v
 
-bindGlobal :: String -> Maybe (Closure [Var] Term) -> Env -> Env
+bindGlobal :: String -> GlobalEntry -> Env -> Env
 bindGlobal n v e = e {
   globalEnv = M.insert n v $ globalEnv e
 }
@@ -130,7 +131,7 @@ vMetaTy m@(MetaVar _ mid subs) = do
 
 vTop :: MonadMEnv m => Env -> [Spine] -> Const Val -> m Val
 vTop env sp c@(Const name subs) = do
-  case lookupGlobal env name of
+  case fst $ lookupGlobal env name of
     Just b -> VTop c sp . Just . Thunk <$> (vSpine sp =<< b $$ (`zip'` subs))
     Nothing -> return $ VTop c sp Nothing
 
@@ -290,7 +291,8 @@ reify b (VRigid v sp) = reifySpine b sp (Var v)
 
 reify b (VFlex (MetaVar name mid subs) sp) =
   reifySpine b sp . MVar . MetaVar name mid =<< mapM (reify b) subs
--- Axiomatized constants, skip
+  -- unfold meta?
+
 reify b (VTop (Const name subs) sp mval) =
   case (b, mval) of
     (True, Just val) -> reifySpine True sp =<< reify True (unthunk val)

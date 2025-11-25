@@ -35,6 +35,12 @@ bindEnv var val ctx = ctx {
   env = bindLocal [(var, val)] (env ctx)
 }
 
+declareConst :: String -> GlobalEntry
+  -> Context -> Context
+declareConst name val ctx = ctx {
+  env = bindGlobal name val (env ctx)
+}
+
 class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m
 
 -- Prepare some primitive operations
@@ -146,6 +152,8 @@ infer RHole = do -- todo typed holes
   mty <- freshAnonMeta
   vty <- evalTyM (MTyVar mty)
   return (MVar m, Thunk vty)
+
+-- infer toplevel
 
 infer (RThe rty rtm) = do
   ty <- checkTy rty
@@ -259,6 +267,29 @@ expectPiSigma b ty = do
   unify [Right (Thunk ty,
     Thunk $ (if b then VPi else VSigma) (Thunk dom) cod)]
   return (dom, cod)
+
+checkTelescope :: Tyck m => [(RVar, Raw)] -> m a -> m a
+checkTelescope [] cont = cont
+checkTelescope ((rv, rty):tel) cont = do
+  let v = coerce rv :: Var
+  ty <- checkTy rty
+  vty <- evalTyM ty
+  local (newVar rv v (Thunk vty)) $ checkTelescope tel cont
+
+checkTop :: Tyck m => String -> [(RVar, Raw)] -> Raw -> Maybe Raw -> m a -> m a
+checkTop name tel rty mtm cont = do
+  let vars = coerce (map fst tel) :: [Var]
+  (tm, ty) <- checkTelescope tel $ do
+    ty <- checkTy rty
+    case mtm of
+      Nothing -> return (Nothing, ty)
+      Just rtm -> do
+        vty <- evalTyM ty
+        tm <- check rtm vty
+        return (Just tm, ty)
+  e <- asks env
+  local (declareConst name
+    (Closure e . bind vars <$> tm, Closure e $ bind vars ty)) cont
 
 ----- Unification algorithm -----
 -- the `conv` family of functions output Nothing when it should be postponed,
