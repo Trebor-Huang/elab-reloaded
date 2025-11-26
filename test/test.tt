@@ -13,12 +13,14 @@ define
     x)
 
 define
-  A : U; B : U; p : A * B |- flip : B * A
-  = pair(snd(p), fst(p))
+  A : U; B : U |- flip : (A * B) -> (B * A)
+  = \p. pair(snd(p), fst(p))
 
 define
   A : U; B : U; C : U |- compose : (A -> B) -> (B -> C) -> (A -> C)
   = λf. λg. λa. g (f a)
 
 eval
-  the(Id(Nat, ack() 3 4, 125), refl(_, _))
+  the(Id((Nat * Nat) -> (Nat * Nat),
+    compose(_,_,_) flip(_,_) flip(_,_),
+    (\x. x)), refl(_, _))
