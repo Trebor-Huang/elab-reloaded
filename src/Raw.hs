@@ -74,13 +74,16 @@ pTimes = (symbol "×" <|> symbol "*") <?> "times"
 pArrowTimes :: Parser Bool
 pArrowTimes = (True <$ pArrow) <|> (False <$ pTimes)
 
-pIdent :: Parser String
-pIdent = try (do
+pIdent_ :: Parser String
+pIdent_ = try (do
   x0 <- C.letterChar
   guard $ x0 /= 'λ'
   x <- takeWhileP Nothing (\x -> C.isAlphaNum x || (x == '\''))
   guard $ notElem (x0:x) ["define", "postulate", "eval"] -- keywords
-  (x0:x) <$ spaceEater) <?> "identifier"
+  return (x0:x)) <?> "identifier"
+
+pIdent :: Parser String
+pIdent = pIdent_ <* spaceEater
 
 pAtom :: Parser ParseTree
 pAtom = choice [
@@ -135,7 +138,7 @@ funOrSpine = do
 
 pCons :: Parser ParseTree
 pCons = do
-  cons <- pIdent
+  cons <- pIdent_ -- you can't have space here
   args <- parens $ (try pBinders <|> (([],) <$> pRaw)) `sepBy` char ','
   return $ TNode cons args
 
