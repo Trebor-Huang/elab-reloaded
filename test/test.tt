@@ -1,13 +1,16 @@
 postulate
-  A : U ; x y : A |- Id : U
+  A : U ; x y : A ⊢ Id : U
+
+postulate
+  A : U ; x : A ⊢ refl : Id(A, x, x)
 
 define
   |- ack : Nat -> Nat -> Nat
-  = λx. elim(_. _,
+  = λx. elim(_. _, -- motive
     {- zero -}     λx. suc(x),
     {- suc -} x r. λx.
       elim(_. _, r suc(zero), m s. r s, x),
     x)
 
 eval
-  ack() 3 4
+  the(Id(Nat, ack() 3 4, 125), refl(_, _))

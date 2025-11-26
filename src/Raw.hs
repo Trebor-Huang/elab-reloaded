@@ -203,10 +203,10 @@ toRaw _ _ (TNode v _) = throwError $ "Unrecognized identifier: " ++ v
 
 {-
 postulate
-  x : A ; y : B |- c : C
+  x : A ; y : B ⊢ c : C
 
 define
-  x : A ; y : B |- c : C
+  x : A ; y : B ⊢ c : C
     = E
 
 eval E'

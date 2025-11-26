@@ -8,7 +8,9 @@ import TypeCheck
 main :: IO ()
 main = do
   src <- readFile "./test/test.tt"
+  putStrLn "Read file."
   (decl, expr) <- parseString src
+  putStrLn "Parsed file."
   case evalTyckM $ processFile decl expr of
     Left err -> putStrLn err
     Right (ty, tm, ntm) -> do

@@ -338,6 +338,14 @@ conv (VRigid v sp) (VRigid v' sp') =
     Just <$> convSp sp sp'
   else
     throwError $ "Not convertible: " ++ show v ++ " /= " ++ show v'
+-- postulated constants are also rigid
+conv (VTop (Const name arg) sp Nothing) (VTop (Const name' arg') sp' Nothing) =
+  if name /= name' then
+    throwError $ "Not convertible: " ++ name ++ " /= " ++ name'
+  else do
+    let eq_arg = zipWith (\a b -> Left (Thunk a, Thunk b)) arg arg'
+    sp_arg <- convSp sp sp'
+    return $ Just (eq_arg ++ sp_arg)
 -- rigid-flex and flex-rigid
 conv (VFlex m sp) v =
   (\b -> if b then Just [] else Nothing) <$> solve m sp v
@@ -541,8 +549,9 @@ processFile [] expr = do
   (tm, vty) <- infer expr
   ty <- reifyTy UnfoldMeta =<< forceTy vty
   vtm <- evalM tm
+  ztm <- zonk tm
   ntm <- reify UnfoldDef vtm
-  return (ty, tm, ntm)
+  return (ty, ztm, ntm)
 processFile ((rj,name):decl) expr = do
   j <- checkJudgment rj
   local (declareConst name j) $ processFile decl expr
