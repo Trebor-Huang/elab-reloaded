@@ -158,7 +158,7 @@ checkJudgment (Hypo rty bj) = do
   ty <- checkTy rty
   vty <- evalTyM ty
   (x, j) <- unbind bj
-  let x' = coerce x' :: Var
+  let x' = coerce x :: Var
   entry <- local (newVar x x' (Thunk vty)) $ checkJudgment j
   return $ Hypothetic ty $ bind x' entry
 
