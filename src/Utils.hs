@@ -19,4 +19,4 @@ showList__ _     []     s = "[]" ++ s
 showList__ showx (x:xs) s = '[' : showx x (showl xs)
   where
     showl []     = ']' : s
-    showl (y:ys) = ',' : showx y (showl ys)
+    showl (y:ys) = ", " ++ showx y (showl ys)

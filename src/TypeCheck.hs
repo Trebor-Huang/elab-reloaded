@@ -175,7 +175,7 @@ infer (RConst name args) = do
     Nothing -> error "Impossible: constant not found"
     Just entry -> do
       (targs, ty) <- go entry args
-      return (Top (Const name targs), ty)
+      return (Con (Const name targs), ty)
   where
     go :: Tyck m => GlobalEntry -> [Raw] -> m ([Term], Thunk TyVal)
     -- check arguments
@@ -339,7 +339,7 @@ conv (VRigid v sp) (VRigid v' sp') =
   else
     throwError $ "Not convertible: " ++ show v ++ " /= " ++ show v'
 -- postulated constants are also rigid
-conv (VTop (Const name arg) sp Nothing) (VTop (Const name' arg') sp' Nothing) =
+conv (VCon (Const name arg) sp Nothing) (VCon (Const name' arg') sp' Nothing) =
   if name /= name' then
     throwError $ "Not convertible: " ++ name ++ " /= " ++ name'
   else do
@@ -501,7 +501,7 @@ zonk (MVar (MetaVar name mid subs)) = do
     Just s -> zonkMeta s subs
     Nothing -> MVar . MetaVar name mid <$> mapM zonk subs
 zonk (Var v) = return $ Var v
-zonk (Top (Const name subs)) = Top . Const name <$> mapM zonk subs
+zonk (Con (Const name subs)) = Con . Const name <$> mapM zonk subs
 zonk (Lam f) = do
   (x, f') <- unbind f
   zf <- local (bindEnv x (VVar x)) $ zonk f'

@@ -3,7 +3,7 @@ module NbE (
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
-  vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vTop,
+  vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
   Unfold(..), reify, reifyTy, reifySpine, nf,
@@ -92,7 +92,7 @@ data Spine
 data Val
   = VFlex (MetaVar Val) [Spine]
   | VRigid Var [Spine]
-  | VTop (Const Val) [Spine] !(Maybe (Thunk Val))
+  | VCon (Const Val) [Spine] !(Maybe (Thunk Val))
     -- the thunk should be lazy, but the Maybe should be strict
   -- Constructors
   | VLam (Closure Var Term)
@@ -137,20 +137,20 @@ vMetaTy m@(MetaVar _ mid subs) = do
     Just b -> b $$: (`zip'` subs)
     Nothing -> return $ VMTyVar m
 
-vTop :: MonadMEnv m => Env -> [Spine] -> Const Val -> m Val
-vTop env sp c@(Const name subs) = do
-  result <- go env (lookupGlobal env name) subs
+vCon :: MonadMEnv m => Env -> [Spine] -> Const Val -> m Val
+vCon env sp c@(Const name subs) = do
+  result <- vCon' env (lookupGlobal env name) subs
   case result of
-    Just th -> VTop c sp . Just . Thunk <$> vSpine sp (unthunk th)
-    Nothing -> return $ VTop c sp Nothing
-  where
-    go :: MonadMEnv m => Env -> GlobalEntry -> [Val] -> m (Maybe (Thunk Val))
-    go env (Hypothetic _ bg) (v:subs) = do
-      (x, g) <- unbind bg
-      go (bindLocal [(x, v)] env) g subs
-    go env (Definition _ tm) [] = Just . Thunk <$> eval env tm
-    go _ (Postulate _) [] = return Nothing
-    go _ _ _ = error "Impossible"
+    Just th -> VCon c sp . Just . Thunk <$> vSpine sp (unthunk th)
+    Nothing -> return $ VCon c sp Nothing
+
+vCon' :: MonadMEnv m => Env -> GlobalEntry -> [Val] -> m (Maybe (Thunk Val))
+vCon' env (Hypothetic _ bg) (v:subs) = do
+  (x, g) <- unbind bg
+  vCon' (bindLocal [(x, v)] env) g subs
+vCon' env (Definition _ tm) [] = Just . Thunk <$> eval env tm
+vCon' _ (Postulate _) [] = return Nothing
+vCon' _ _ _ = error "Impossible"
 
 vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
 vSpine [] v = return v
@@ -167,7 +167,7 @@ vApp t u = case t of
   VLam t' -> t' $$ \x -> [(x, u)]
   VFlex mv sp -> return $ VFlex mv (VApp (Thunk u) : sp)
   VRigid v sp -> return $ VRigid v (VApp (Thunk u) : sp)
-  VTop c sp v -> VTop c (VApp (Thunk u) : sp) <$>
+  VCon c sp v -> VCon c (VApp (Thunk u) : sp) <$>
     case v of
       Just th -> Just . Thunk <$> vApp (unthunk th) u
       Nothing -> return Nothing
@@ -177,13 +177,13 @@ vFst, vSnd, vSuc :: Val -> Val
 vFst (VPair t _) = unthunk t
 vFst (VFlex mv sp) = VFlex mv (VFst:sp)
 vFst (VRigid v sp) = VRigid v (VFst:sp)
-vFst (VTop c sp v) = VTop c (VFst:sp) $ Thunk . vFst . unthunk <$> v
+vFst (VCon c sp v) = VCon c (VFst:sp) $ Thunk . vFst . unthunk <$> v
 vFst _ = error "Impossible"
 
 vSnd (VPair _ t) = unthunk t
 vSnd (VFlex mv sp) = VFlex mv (VSnd:sp)
 vSnd (VRigid v sp) = VRigid v (VSnd:sp)
-vSnd (VTop c sp v) = VTop c (VSnd:sp) $ Thunk . vSnd . unthunk <$> v
+vSnd (VCon c sp v) = VCon c (VSnd:sp) $ Thunk . vSnd . unthunk <$> v
 vSnd _ = error "Impossible"
 
 vSuc (VSuc k v') = VSuc (k+1) v'
@@ -214,7 +214,7 @@ vNatElim m z s = \case
 -- Looking up the metavariables if there is one, lazily
 force :: MonadMEnv m => Thunk Val -> m Val
 force (Thunk (VFlex m sp)) = vMeta sp m
-force (Thunk (VTop _ _ (Just val))) = force val
+force (Thunk (VCon _ _ (Just val))) = force val
 force (Thunk a) = return a
 
 forceTy :: MonadMEnv m => Thunk TyVal -> m TyVal
@@ -228,8 +228,10 @@ eval env = \case
   Var x -> return $ lookupLocal env x
   MVar (MetaVar name mid subs)
     -> vMeta [] . MetaVar name mid =<< mapM (eval env) subs
-  Top (Const name subs)
-    -> vTop env [] . Const name =<< mapM (eval env) subs
+  Con (Const name subs)
+    -> vCon env [] . Const name =<< mapM (eval env) subs
+  -- Let name clause body
+  --   -> eval (bindGlobal name _ env) body
   Lam s -> return $ VLam $ Closure env s
   App t1 t2 -> do
     v1 <- eval env t1
@@ -311,10 +313,10 @@ reify b (VFlex m@(MetaVar name mid subs) sp) =
     NoUnfold -> reifySpine b sp . MVar . MetaVar name mid =<< mapM (reify b) subs
     _ -> reify b =<< vMeta sp m
 
-reify b (VTop (Const name subs) sp mval) =
+reify b (VCon (Const name subs) sp mval) =
   case (b, mval) of
     (UnfoldDef, Just val) -> reify b (unthunk val)
-    _ -> reifySpine b sp . Top . Const name =<< mapM (reify b) subs
+    _ -> reifySpine b sp . Con . Const name =<< mapM (reify b) subs
 
 reify b (VLam c) = do
   (x, c') <- c $$+ \x -> [(x, VVar x)]

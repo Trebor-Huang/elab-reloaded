@@ -1,7 +1,6 @@
 module Syntax (
   Var, MetaVar(..), Const(..),
-  Term(..), Type(..),
-  nfSubst
+  Term(..), Type(..)
 ) where
 import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
@@ -17,7 +16,8 @@ data MetaVar a = MetaVar
 data Const a = Const !String [a] deriving (Show, Generic)
 
 data Term
-  = Var Var | MVar (MetaVar Term) | Top (Const Term)
+  = Var Var | MVar (MetaVar Term)
+  | Con (Const Term) -- | Let !String (Bind [Var] Term) Term -- todo type decl
   | Lam (Bind Var Term) | App Term Term
   | Pair Term Term | Fst Term | Snd Term
   | Zero | Suc Term
@@ -36,9 +36,10 @@ showTermM i = \case
   MVar (MetaVar name _ subs) ->
     (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
-  Top (Const name subs) ->
+  Con (Const name subs) ->
     (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
+  -- Let name clause body -> _
   Lam t -> lunbind t \(x, t') -> do
     s <- showTermM 0 t'
     return (showParen (i > 0) $
@@ -125,9 +126,7 @@ showTypeM i = \case
         showString " → " . s2)
   Nat -> return (showString "Nat")
   Universe -> return (showString "U")
-  El t -> do
-    s <- showTermM 0 t
-    return (showString "El" . showParen True s)
+  El t -> showTermM i t
 
 
 instance Show Type where
@@ -146,61 +145,3 @@ instance Subst Term Type
 
 instance Subst Term (MetaVar Term)
 instance Subst Term (Const Term)
-
------ Substitution based normalization -----
-substnf :: Term -> FreshM Term
-substnf (Var x) = return $ Var x
-substnf (MVar (MetaVar name mid subs))
-  = MVar . MetaVar name mid <$> mapM substnf subs
-substnf Top {} = error "I can't do this"
-substnf (Lam t) = do
-  (y, t') <- unbind t
-  Lam . bind y <$> substnf t'
-substnf (App t1 t2) = do
-  n1 <- substnf t1
-  case n1 of
-    Lam t -> do
-      n2 <- substnf t2
-      substnf $ substBind t n2
-    _ -> App n1 <$> substnf t2
-substnf (Pair t1 t2) = Pair <$> substnf t1 <*> substnf t2
-substnf (Fst t) = do
-  n <- substnf t
-  case n of
-    Pair n1 _ -> return n1
-    _ -> return $ Fst n
-substnf (Snd t) = do
-  n <- substnf t
-  case n of
-    Pair _ n2 -> return n2
-    _ -> return $ Snd n
-substnf Zero = return Zero
-substnf (Suc t) = Suc <$> substnf t
-substnf (NatElim m z s t) = do -- we don't deal with the motive
-  n <- substnf t
-  go n
-  where
-    go :: Term -> FreshM Term
-    go Zero = substnf z
-    go (Suc n) = do
-      res <- go n
-      substnf $ instantiate s [n, res]
-    go r = return $ NatElim m z s r
-substnf (Quote ty) = Quote <$> substnft ty
-substnf (The _ tm) = substnf tm
-
-substnft :: Type -> FreshM Type
-substnft (MTyVar (MetaVar name mid subs))
-  = MTyVar . MetaVar name mid <$> mapM substnf subs
-substnft (Sigma t1 t2) = do
-  (y, t2') <- unbind t2
-  Sigma <$> substnft t1 <*> (bind y <$> substnft t2')
-substnft (Pi t1 t2) = do
-  (y, t2') <- unbind t2
-  Pi <$> substnft t1 <*> (bind y <$> substnft t2')
-substnft Nat = return Nat
-substnft Universe = return Universe
-substnft (El t) = El <$> substnf t
-
-nfSubst :: Term -> Term
-nfSubst = runFreshM . substnf
