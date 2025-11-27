@@ -338,7 +338,7 @@ conv (VRigid v sp) (VRigid v' sp') =
     Just <$> convSp sp sp'
   else
     throwError $ "Not convertible: " ++ show v ++ " /= " ++ show v'
--- postulated constants are also rigid
+-- constants that don't unfold are also rigid
 conv (VCon (Const name arg) sp Nothing) (VCon (Const name' arg') sp' Nothing) =
   if name /= name' then
     throwError $ "Not convertible: " ++ name ++ " /= " ++ name'

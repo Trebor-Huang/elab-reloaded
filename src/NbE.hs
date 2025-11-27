@@ -17,6 +17,7 @@ import GHC.Generics
 import Unbound.Generics.LocallyNameless
 
 import Syntax
+import Cofibration
 import Utils
 
 --- Environment
@@ -30,11 +31,13 @@ instance Alpha GlobalEntry
 
 data Env = Env {
   localEnv :: M.Map Var Val,
-  globalEnv :: M.Map String GlobalEntry
+  globalEnv :: M.Map String GlobalEntry,
+  localTokens :: Cof,
+  globalTokens :: World
 } deriving Show
 
 emptyEnv :: Env
-emptyEnv = Env M.empty M.empty
+emptyEnv = Env M.empty M.empty [] []
 
 lookupLocal :: Env -> Var -> Val
 lookupLocal e v = case M.lookup v (localEnv e) of
@@ -92,7 +95,7 @@ data Spine
 data Val
   = VFlex (MetaVar Val) [Spine]
   | VRigid Var [Spine]
-  | VCon (Const Val) [Spine] !(Maybe (Thunk Val))
+  | VCon (Const Val) [Spine] !(Cases (Thunk Val))
     -- the thunk should be lazy, but the Maybe should be strict
   -- Constructors
   | VLam (Closure Var Term)

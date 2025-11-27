@@ -6,6 +6,7 @@ import Unbound.Generics.LocallyNameless
 import GHC.Generics (Generic)
 import Control.Lens (anyOf)
 
+import Cofibration
 import Utils
 
 type Var = Name Term
@@ -16,17 +17,28 @@ data MetaVar a = MetaVar
 data Const a = Const !String [a] deriving (Show, Generic)
 
 data Term
+  -- variables and metavariables
   = Var Var | MVar (MetaVar Term)
+  -- constants -- todo add type constants
   | Con (Const Term) -- | Let !String (Bind [Var] Term) Term -- todo type decl
+  -- function type
   | Lam (Bind Var Term) | App Term Term
+  -- pair type
   | Pair Term Term | Fst Term | Snd Term
+  -- natural numbers
   | Zero | Suc Term
   | NatElim
     {- motive -} (Bind Var Type)
     {- zero -} Term
     {- suc -} (Bind (Var, Var) Term)
     {- arg -} Term
+  -- Pushforward type
+  | Lock Cof Term | Unlock Term Cof
+  -- Extension type
+  | InCof Cof Term | OutCof Cof Term
+  -- universe type
   | Quote Type
+  -- type ascription
   | The Type Term
   deriving (Generic) -- TODO get a readback to raw terms and test roundtrip
 
@@ -93,6 +105,8 @@ data Type -- Note there is no type variables
   | Sigma Type (Bind Var Type)
   | Pi Type (Bind Var Type)
   | Nat
+  | PushForward Cof Type
+  | Ext Type Cof Term
   | Universe
   | El Term
   deriving (Generic)
@@ -137,6 +151,7 @@ instance Alpha a => Alpha (Const a)
 instance Alpha Term
 instance Alpha Type
 
+instance Subst Term Atom
 instance Subst Term Term where
   isvar (Var x) = Just (SubstName x)
   isvar _ = Nothing
