@@ -35,7 +35,7 @@ data Term
   -- Pushforward type
   | Lock Cof Term | Unlock Term Cof
   -- Extension type
-  | InCof Cof Term | OutCof Cof Term
+  | InCof Cof Term | OutCof Cof {- restrict -} Term {- actual -} Term
   -- universe type
   | Quote Type
   -- type ascription
@@ -91,6 +91,22 @@ showTermM i = \case
     st <- showTermM 0 t
     return $ showString "elim" .
       showParen True (sm . sz . showString ", " . ss . st)
+
+  -- todo hide these constructors
+  Lock p t -> do
+    s <- showTermM 0 t
+    return (showParen (i > 0) $
+      showString "🔒" . shows p . showString ". " . s)
+  Unlock t p -> do
+    s <- showTermM 10 t
+    return (showParen (i > 10) $ s . showString " @" . shows p)
+  InCof p t -> do
+    s <- showTermM 0 t
+    return $ showParen (i > 0) (showString "In⟨" . shows p . showString "⟩ " . s)
+  OutCof p _ t -> do -- todo show the restriction
+    s <- showTermM 0 t
+    return $ showParen (i > 0) (showString "Out⟨" . shows p . showString "⟩ " . s)
+
   Quote t -> showTypeM i t
   The ty tm -> do
     sty <- showTypeM 1 ty
@@ -105,7 +121,7 @@ data Type -- Note there is no type variables
   | Sigma Type (Bind Var Type)
   | Pi Type (Bind Var Type)
   | Nat
-  | PushForward Cof Type
+  | Pushforward Cof Type
   | Ext Type Cof Term
   | Universe
   | El Term
@@ -139,6 +155,18 @@ showTypeM i = \case
         else s1) .
         showString " → " . s2)
   Nat -> return (showString "Nat")
+
+  Pushforward p ty -> do
+    s <- showTypeM 0 ty
+    return (showParen (i > 0) $
+      showString "{" . shows p . showString "}" . s)
+  Ext ty p tm -> do
+    sty <- showTypeM 0 ty
+    stm <- showTermM 0 tm
+    return $ showString "{ " . sty .
+      showString " | " . shows p .
+      showString " ↪ " . stm . showString " }"
+
   Universe -> return (showString "U")
   El t -> showTermM i t
 
@@ -151,7 +179,6 @@ instance Alpha a => Alpha (Const a)
 instance Alpha Term
 instance Alpha Type
 
-instance Subst Term Atom
 instance Subst Term Term where
   isvar (Var x) = Just (SubstName x)
   isvar _ = Nothing
