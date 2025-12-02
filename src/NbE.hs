@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 module NbE (
-  GlobalEntry(..), Env(..), emptyEnv,
+  GlobalEntry(..), Env(..), emptyEnv, CofEnv(..), emptyCofEnv,
   bindLocal, lookupLocal, bindGlobal, lookupGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
@@ -8,7 +8,7 @@ module NbE (
   vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  Unfold(..), reify, reifyTy, reflectSpine, nf,
+  reify, reifyTy, reflectSpine, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
@@ -67,8 +67,8 @@ data CofEnv = CofEnv {
   globalTokens :: World
 } deriving Show
 
--- emptyCofEnv :: CofEnv
--- emptyCofEnv = CofEnv mempty []
+emptyCofEnv :: CofEnv
+emptyCofEnv = CofEnv mempty emptyWorld
 
 bindToken :: Cof -> CofEnv -> CofEnv
 bindToken p cofEnv = cofEnv {
@@ -132,12 +132,12 @@ data Val
   deriving Show
 
 data TyVal
-  = VMTyVar (MetaVar Val)
-  | VEl (Thunk Val)
+  = VMTyVar (MetaVar Val) !(Cases (Thunk TyVal))
+  | VEl Val
     -- this should be VTyNeutral,
-    -- but none of the others would be type correct except VQuote
-    -- which we deal with manually
-    -- TODO this should be stablized
+    -- but the thunk inside can only be neutral terms to be type correct
+    -- except VQuote which we deal with manually
+    -- It doesn't modify the destabilization either so
   -- Type constructors
   | VSigma (Thunk TyVal) (Closure Var Type)
   | VPi (Thunk TyVal) (Closure Var Type)
@@ -157,22 +157,28 @@ toVar :: Val -> Maybe Var
 toVar (VVar v) = Just v
 toVar _ = Nothing
 
-vMeta :: MonadMEnv m => [Spine] -> MetaVar Val -> m Val
-vMeta sp m@(MetaVar _ mid subs) = do
+vMeta :: MonadMEnv m => [Spine] -> Cases (Thunk Val) -> MetaVar Val -> m Val
+vMeta sp st m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . termSol)
   case sol of
-    Just b -> VFlex m sp . SingleCase unfoldMeta . Thunk <$>
-      (vSpine sp =<< b $$ (`zip'` subs))
+    Just b -> do
+      b' <- b $$ (`zip'` subs)
+      vsol <- vSpine sp b'
+      let unfoldCase = SingleCase unfoldMeta (Thunk vsol)
+      return $ VFlex m sp $ unfoldCase <> st
     Nothing -> return $ VFlex m sp EmptyCases
 
-vMetaTy :: MonadMEnv m => MetaVar Val -> m TyVal
-vMetaTy m@(MetaVar _ mid subs) = do
+vMetaTy :: MonadMEnv m => Cases (Thunk TyVal) -> MetaVar Val -> m TyVal
+vMetaTy st m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . typeSol)
   case sol of
-    -- todo
-    Just b -> b $$: (`zip'` subs)
-    Nothing -> return $ VMTyVar m
+    Just b -> do
+      vsol <- b $$: (`zip'` subs)
+      let unfoldCase = SingleCase unfoldMeta (Thunk vsol)
+      return $ VMTyVar m $ unfoldCase <> st
+    Nothing -> return $ VMTyVar m st
 
+-- TODO does this need stabilization info?
 vCon :: MonadMEnv m => Env -> CofEnv -> [Spine] -> Const Val -> m Val
 vCon env cofEnv sp c@(Const name subs) = do
   -- this does not use emptyEnv and emptyCofEnv, because
@@ -221,7 +227,6 @@ thApp u x = Thunk <$> vApp (unthunk x) u
 
 vUnlock :: MonadMEnv m => Val -> Cof -> m Val
 vUnlock t p = case t of
-  -- todo should I check (p == q) up to theory, or syntactically?
   VLock q t' -> t' $$? q
   VFlex mv sp st ->
     VFlex mv (VUnlock p : sp) <$> mapM (thUnlock p) st
@@ -234,7 +239,6 @@ vUnlock t p = case t of
 thUnlock p x = Thunk <$> vUnlock (unthunk x) p
 
 vOutCof :: Cof -> Thunk Val -> Val -> Val
--- todo check equality?
 vOutCof _ _ (VInCof _ t) = unthunk t
 vOutCof p u (VFlex mv sp st)
   = VFlex mv (VOutCof p u:sp) $ SingleCase p u <> (thOutCof p u <$> st)
@@ -268,7 +272,7 @@ vSuc v = VSuc 1 (Thunk v)
 
 vEl :: Val -> TyVal
 vEl (VQuote ty) = unthunk ty
-vEl v = VEl (Thunk v)
+vEl v = VEl v
 
 vNatElim :: MonadMEnv m
   => Closure Var Type
@@ -301,7 +305,7 @@ thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 force :: MonadMEnv m => CofEnv -> Thunk Val -> m Val
 force cofEnv (Thunk (VFlex mv sp st))
   | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
-  | otherwise = vMeta sp mv
+  | otherwise = vMeta sp st mv
 force cofEnv (Thunk (VRigid _ sp st))
   | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
 force cofEnv (Thunk (VCon _ sp st))
@@ -309,7 +313,10 @@ force cofEnv (Thunk (VCon _ sp st))
 force _ (Thunk a) = return a
 
 forceTy :: MonadMEnv m => CofEnv -> Thunk TyVal -> m TyVal
-forceTy _ (Thunk (VMTyVar m)) = vMetaTy m
+forceTy cofEnv (Thunk (VMTyVar m st))
+  | Just x <- cofSelect cofEnv st = forceTy cofEnv x
+  | otherwise = vMetaTy st m
+forceTy cofEnv (Thunk (VEl t)) = VEl <$> force cofEnv (Thunk t)
 forceTy _ (Thunk a) = return a
 
 ------ Normalization by evaluation ------
@@ -318,7 +325,7 @@ eval :: MonadMEnv m => Env -> CofEnv -> Term -> m Val
 eval env cofEnv = \case
   Var x -> return $ lookupLocal env x
   MVar (MetaVar name mid subs)
-    -> vMeta [] . MetaVar name mid =<< mapM (eval env cofEnv) subs
+    -> vMeta [] EmptyCases . MetaVar name mid =<< mapM (eval env cofEnv) subs
   Con (Const name subs)
     -> vCon env cofEnv [] . Const name =<< mapM (eval env cofEnv) subs
   -- Let name clause body
@@ -363,7 +370,7 @@ eval env cofEnv = \case
 evalTy :: MonadMEnv m => Env -> CofEnv -> Type -> m TyVal
 evalTy env cofEnv = \case
   MTyVar (MetaVar name mid subs)
-    -> vMetaTy . MetaVar name mid =<< mapM (eval env cofEnv) subs
+    -> vMetaTy EmptyCases . MetaVar name mid =<< mapM (eval env cofEnv) subs
   Sigma t1 t2 -> do
     v1 <- evalTy env cofEnv t1
     return $ VSigma (Thunk v1) (Closure env cofEnv t2)
@@ -408,13 +415,8 @@ Closure env cofEnv t $$:? p = do
   (_, s) <- unbind t
   evalTy env (bindToken p cofEnv) s
 
--- TODO are these also cofibrations?
-data Unfold = NoUnfold | UnfoldMeta | UnfoldDef deriving (Eq, Show)
-
-reify :: MonadMEnv m => CofEnv -> Val -> m Term
-reflectSpine :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term
-
 ---- Reflection
+reflectSpine :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term
 reflectSpine _ [] val = return val
 reflectSpine cofEnv (c:sp) val0 = do
   val <- reflectSpine cofEnv sp val0
@@ -423,20 +425,19 @@ reflectSpine cofEnv (c:sp) val0 = do
     VFst -> return $ Fst val
     VSnd -> return $ Snd val
     VNatElim cm cz cs -> do -- TODO should we not normalize the motive?
-      (n, vm) <- cm $$:+ \n -> [(n, VVar n)]
-      tym <- reifyTy cofEnv vm
-      vz <- cz $$ \() -> []
-      tz <- reify cofEnv vz
-      (p, vs) <- cs $$+ \(k,r) -> [(k, VVar k), (r, VVar r)]
-      ts <- reify cofEnv vs
-      -- instead of (bind n tym), directly use cm
-      return $ NatElim (bind n tym) tz (bind p ts) val
+      tym <- cm $$:- \n -> [(n, VVar n)]
+      tz <- cz $$- \() -> []
+      (_, tz') <- unbind tz
+      ts <- cs $$- \(k,r) -> [(k, VVar k), (r, VVar r)]
+      -- instead of tym, directly use cm
+      return $ NatElim tym tz' ts val
     VUnlock p -> return $ Unlock val p
     VOutCof p u -> do
       vu <- force cofEnv u
       tu <- reify cofEnv vu
       return $ OutCof p tu val
 
+reify :: MonadMEnv m => CofEnv -> Val -> m Term
 -- We assume these are already forced
 reify cofEnv (VRigid v sp _) = reflectSpine cofEnv sp (Var v)
 reify cofEnv (VFlex (MetaVar name mid subs) sp _)
@@ -445,10 +446,7 @@ reify cofEnv (VCon (Const name subs) sp _)
   = reflectSpine cofEnv sp . Con . Const name =<< mapM (reify cofEnv) subs
 
 ---- Reification
-reify cofEnv (VLam c) = do
-  (x, c') <- c $$+ \x -> [(x, VVar x)]
-  t <- reify cofEnv c'
-  return $ Lam (bind x t)
+reify _ (VLam c) = Lam <$> c $$- \x -> [(x, VVar x)]
 reify cofEnv (VPair th1 th2) = do
   v1 <- force cofEnv th1
   v2 <- force cofEnv th2
@@ -457,40 +455,59 @@ reify cofEnv (VPair th1 th2) = do
 reify _ VZero = return Zero
 reify cofEnv (VSuc k th) = nTimes k Suc <$> (reify cofEnv =<< force cofEnv th)
 
-reify cofEnv (VLock p c) = do
-  c' <- c $$? p
-  t <- reify cofEnv c'
-  return $ Lock p t
+reify _ (VLock p c) = Lock p <$> c $$?- p
 
 reify cofEnv (VInCof p th) = InCof p <$> (reify cofEnv =<< force cofEnv th)
 
 reify cofEnv (VQuote thty) = Quote <$> (reifyTy cofEnv =<< forceTy cofEnv thty)
 
 reifyTy :: MonadMEnv m => CofEnv -> TyVal -> m Type
-reifyTy cofEnv (VMTyVar (MetaVar name mid subs))
+-- reflection
+reifyTy cofEnv (VMTyVar (MetaVar name mid subs) _)
   = MTyVar . MetaVar name mid <$> mapM (reify cofEnv) subs
+
+-- reification
 reifyTy cofEnv (VSigma thty c) = do
   ty <- reifyTy cofEnv =<< forceTy cofEnv thty
-  (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- reifyTy cofEnv c'
-  return $ Sigma ty (bind x t)
+  t <- c $$:- \x -> [(x, VVar x)]
+  return $ Sigma ty t
 reifyTy cofEnv (VPi thty c) = do
   ty <- reifyTy cofEnv =<< forceTy cofEnv thty
-  (x, c') <- c $$:+ \x -> [(x, VVar x)]
-  t <- reifyTy cofEnv c'
-  return $ Pi ty (bind x t)
+  t <- c $$:- \x -> [(x, VVar x)]
+  return $ Pi ty t
 reifyTy _ VNat = return Nat
-reifyTy cofEnv (VPushforward p c) = do
-  vty <- c $$:? p  -- todo What?? is this even correct?
-  ty <- reifyTy cofEnv vty
-  return $ Pushforward p ty
+reifyTy _ (VPushforward p c) = Pushforward p <$> c $$:?- p
 reifyTy cofEnv (VExt thty p c) = do
   ty <- reifyTy cofEnv =<< forceTy cofEnv thty
-  vtm <- c $$? p
-  tm <- reify cofEnv vtm
-  return $ Ext ty p tm
+  Ext ty p <$> c $$?- p
 reifyTy _ VUniverse = return Universe
-reifyTy cofEnv (VEl th) = El <$> (reify cofEnv =<< force cofEnv th)
+reifyTy cofEnv (VEl tm) = El <$> reify cofEnv tm
+
+($$-) :: (MonadMEnv m, Alpha p) => Closure p Term -> (p -> [(Var, Val)]) -> m (Bind p Term)
+Closure env cofEnv t $$- r = do
+  (x, s) <- unbind t
+  s' <- eval (bindLocal (r x) env) cofEnv s
+  t' <- reify cofEnv s'
+  return (bind x t')
+
+($$:-) :: (MonadMEnv m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (Bind p Type)
+Closure env cofEnv t $$:- r = do
+  (x, s) <- unbind t
+  s' <- evalTy (bindLocal (r x) env) cofEnv s
+  t' <- reifyTy cofEnv s'
+  return (bind x t')
+
+($$?-) :: MonadMEnv m => Closure () Term -> Cof -> m Term
+Closure env cofEnv t $$?- p = do
+  (_, s) <- unbind t
+  s' <- eval env (bindToken p cofEnv) s
+  reify (bindToken p cofEnv) s'
+
+($$:?-) :: MonadMEnv m => Closure () Type -> Cof -> m Type
+Closure env cofEnv t $$:?- p = do
+  (_, s) <- unbind t
+  s' <- evalTy env (bindToken p cofEnv) s
+  reifyTy (bindToken p cofEnv) s'
 
 ---- Example monad to use the functions ----
 type MetaEnvM = StateT MetaEnv FreshM

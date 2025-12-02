@@ -19,11 +19,12 @@ import Utils
 
 data Context = Context {
   env :: !Env,  -- environment for evaluation
+  cofEnv :: !CofEnv,
   vars :: [(RVar, Thunk TyVal)]  -- types of raw variables
 } deriving Show
 
 emptyContext :: Context
-emptyContext = Context emptyEnv []
+emptyContext = Context emptyEnv emptyCofEnv []
 
 newVar :: RVar -> Var -> Thunk TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
@@ -47,13 +48,23 @@ class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m
 -- Prepare some primitive operations
 evalM :: (MonadReader Context m, MonadMEnv m) => Term -> m Val
 evalM tm = do
-  e <- asks env
-  eval e tm
+  Context {env = e, cofEnv = c} <- ask
+  eval e c tm
 
 evalTyM :: (MonadReader Context m, MonadMEnv m) => Type -> m TyVal
 evalTyM ty = do
-  e <- asks env
-  evalTy e ty
+  Context {env = e, cofEnv = c} <- ask
+  evalTy e c ty
+
+forceM :: (MonadReader Context m, MonadMEnv m) => Thunk Val -> m Val
+forceM v = do
+  c <- asks cofEnv
+  force c v
+
+forceTyM :: (MonadReader Context m, MonadMEnv m) => Thunk TyVal -> m TyVal
+forceTyM v = do
+  c <- asks cofEnv
+  forceTy c v
 
 -- freshMeta :: MonadMEnv m => String -> [a] -> m (MetaVar a)
 -- freshMeta name env = do
@@ -85,17 +96,17 @@ insertTypeSol i s = do
 
 close :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 close a th = do
-  t <- force th
-  tm <- reify NoUnfold t
-  e <- asks env
-  return (Closure e (bind a tm))
+  t <- forceM th
+  ctx <- ask
+  tm <- reify (cofEnv ctx) t
+  return $ Closure (env ctx) (cofEnv ctx) (bind a tm)
 
 closeTy :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
 closeTy a th = do
-  t <- forceTy th
-  ty <- reifyTy NoUnfold t
-  e <- asks env
-  return (Closure e (bind a ty))
+  t <- forceTyM th
+  ctx <- ask
+  ty <- reifyTy (cofEnv ctx) t
+  return (Closure (env ctx) (cofEnv ctx) (bind a ty))
 
 check :: Tyck m => Raw -> TyVal -> m Term
 check RHole _ = -- todo typed holes
@@ -109,7 +120,7 @@ check (RLam f) (VPi thdom cod) = do
   return $ Lam $ bind x' t'
 
 check (RPair s1 s2) (VSigma th1 t2) = do
-  t1 <- forceTy th1
+  t1 <- forceTyM th1
   s1' <- check s1 t1
   v1 <- evalM s1'
   t2' <- t2 $$: \y -> [(y, v1)]
@@ -209,10 +220,10 @@ infer (RVar x) = do
 
 infer (RApp rfun rarg) = do
   (fun, thty) <- infer rfun
-  ty <- forceTy thty
+  ty <- forceTyM thty
   (dom, cod) <- case ty of
     VPi thdom cod -> do
-      dom <- forceTy thdom
+      dom <- forceTyM thdom
       return (dom, cod)
     _ -> expectPiSigma True ty
   arg <- check rarg dom
@@ -233,7 +244,7 @@ infer rty@RPi {} = do
 
 infer (RFst r) = do
   (t, th) <- infer r
-  ty <- forceTy th
+  ty <- forceTyM th
   case ty of
     VSigma ty1 _ -> return (Fst t, ty1)
     _ -> do
@@ -241,7 +252,7 @@ infer (RFst r) = do
       return (Fst t, Thunk ty1)
 infer (RSnd r) = do
   (t, th) <- infer r
-  ty <- forceTy th
+  ty <- forceTyM th
   ty2 <- case ty of
     VSigma _ ty2 -> return ty2
     _ -> snd <$> expectPiSigma False ty
@@ -356,14 +367,14 @@ conv (VLam f) (VLam g) = do
   -- so we use this slighly cursed leaking implementation
   (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- g $$ \y -> [(y, VVar x)]
-  s' <- force (Thunk s)
-  t' <- force (Thunk t)
+  s' <- forceM (Thunk s)
+  t' <- forceM (Thunk t)
   conv s' t'
 conv (VLam f) g = do
   (x, s) <- f $$+ \x -> [(x, VVar x)]
   t <- vApp g (VVar x)
-  s' <- force (Thunk s)
-  t' <- force (Thunk t)
+  s' <- forceM (Thunk s)
+  t' <- forceM (Thunk t)
   conv s' t'
 conv g f@VLam {} = conv f g
 
@@ -376,18 +387,18 @@ conv m n@VPair {} = conv n m
 conv VZero VZero = return (Just [])
 conv (VSuc n th) (VSuc m th') =
   if n == m then do
-    t <- force th
-    t' <- force th'
+    t <- forceM th
+    t' <- forceM th'
     conv t t'
   else
     throwError $ show n ++ " /= " ++ show m
 
 conv (VQuote th1) (VQuote th2) = do
-  ty1 <- forceTy th1
-  ty2 <- forceTy th2
+  ty1 <- forceTyM th1
+  ty2 <- forceTyM th2
   convTy ty1 ty2
 conv (VQuote th) tm = do -- Is this necessary?
-  ty <- forceTy th
+  ty <- forceTyM th
   convTy ty (VEl (Thunk tm))
 conv tm tm'@VQuote {} = conv tm' tm
 
@@ -407,11 +418,11 @@ convTy (VPi ty c) (VPi ty' c') -- small hack to reduce repeat
 convTy VNat VNat = return (Just [])
 convTy VUniverse VUniverse = return (Just [])
 convTy (VEl th1) (VEl th2) = do
-  t1 <- force th1
-  t2 <- force th2
+  t1 <- forceM th1
+  t2 <- forceM th2
   conv t1 t2
 convTy (VEl th1) ty = do
-  t1 <- force th1
+  t1 <- forceM th1
   conv t1 (VQuote (Thunk ty))
 convTy ty ty'@VEl {} = convTy ty' ty
 convTy p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
@@ -426,6 +437,7 @@ solve (MetaVar _ mid subs) sp v = do
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo occurs check
+      -- todo this causes a tiny of rechecking
       sol <- close vars (Thunk v)
       insertTermSol mid sol
       return True
@@ -433,7 +445,7 @@ solve (MetaVar _ mid subs) sp v = do
       return False
   where
     spine :: MonadMEnv m => Spine -> m (Maybe Val)
-    spine (VApp s) = Just <$> force s
+    spine (VApp s) = Just <$> forceM s
     spine _ = return Nothing
 
 solveTy :: Tyck m => MetaVar Val -> TyVal -> m Bool
@@ -443,9 +455,9 @@ solveTy (MetaVar _ mid subs) v = do
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo occurs check
-      sol <- reifyTy NoUnfold v
-      e <- asks env
-      insertTypeSol mid (Closure e $ bind vars sol)
+      -- todo this causes a tiny of rechecking
+      sol <- closeTy vars (Thunk v)
+      insertTypeSol mid sol
       return True
     else
       return False
@@ -486,13 +498,13 @@ zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
 zonkMeta sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$ (`zip'` vsubs)
-  reify UnfoldMeta val
+  reify _ val
 
 zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
 zonkMetaTy sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$: (`zip'` vsubs)
-  reifyTy UnfoldMeta val
+  reifyTy _ val
 
 zonk :: Tyck m => Term -> m Term
 zonk (MVar (MetaVar name mid subs)) = do
