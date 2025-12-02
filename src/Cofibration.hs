@@ -5,6 +5,7 @@ module Cofibration (
   Cof, implies, fromAtom, unfoldMeta,
   Cases, pattern EmptyCases, pattern SingleCase, select) where
 import qualified Data.IntMap as IM
+import qualified Data.IntSet as IS
 import GHC.Generics (Generic)
 import Unbound.Generics.LocallyNameless
 
@@ -22,12 +23,13 @@ instance Show Atom where
 
 -- todo more efficient data structures
 data World = World {
-  atoms :: IM.IntMap String ,
-  relations :: [(Atom, Cof)]
+  atoms :: IM.IntMap String,
+  relations :: IM.IntMap Cof,
+  nextAtom :: !Int
 } deriving Show
 
 emptyWorld :: World
-emptyWorld = World IM.empty []
+emptyWorld = World IM.empty IM.empty 0
 
 newtype Cof = Cof (Ignore (IM.IntMap String)) -- a list for conjunctions
   deriving (Generic, Show)
@@ -48,7 +50,11 @@ unfoldMeta = fromAtom $ Atom "?" (-1)
 
 --         W     ;  Phi |- Psi true
 implies :: World -> Cof -> Cof -> Bool
-implies w p q = _
+implies w (Cof p) (Cof q) = let
+  Cof impls = mconcat $
+    map (\k -> IM.findWithDefault mempty k $ relations w) $
+    IM.keys $ unignore p
+  in IM.keysSet (unignore q) `IS.isSubsetOf` IM.keysSet (unignore impls)
 
 newtype Cases a = Cases [(Cof, a)]
   deriving (Functor, Foldable, Traversable, Semigroup, Monoid, Show)
@@ -62,6 +68,11 @@ pattern SingleCase p a = Cases [(p, a)]
 
 --        W     ;  Phi |- case {} == ?
 select :: World -> Cof -> Cases a -> Maybe a
-select = _
+select _ _ (Cases []) = Nothing
+select w p (Cases ((q,a):cs)) =
+  if implies w p q then
+    Just a
+  else
+    select w p (Cases cs)
 
 -- todo is it possible to simplify but not evaluate the branches?
