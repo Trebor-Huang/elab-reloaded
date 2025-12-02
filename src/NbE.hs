@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 module NbE (
   GlobalEntry(..), Env(..), emptyEnv, CofEnv(..), emptyCofEnv,
-  bindLocal, lookupLocal, bindGlobal, lookupGlobal,
+  bindLocal, lookupLocal, bindGlobal, lookupGlobal, bindToken,
   Equation, MetaEnv(..), emptyMetaEnv,
   Closure(..), Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
@@ -21,6 +21,7 @@ import Unbound.Generics.LocallyNameless
 import Syntax
 import Cofibration
 import Utils
+import Control.Monad ((<=<))
 
 -- todo check if all the monad assumptions are required
 --- Environment
@@ -98,7 +99,9 @@ class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
 
 -- A closure stores an environment.
 -- TODO hide the constructor and implement pruning
-data Closure r t = Closure Env CofEnv (Bind r t) deriving Show
+data Closure r t = Closure Env CofEnv (Bind r t)
+instance (Show r, Show t) => Show (Closure r t) where
+  show (Closure _ _ b) = show b
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
@@ -118,9 +121,9 @@ data Spine
 
 data Val
   -- todo these three leads to a lot of repeated clauses
-  = VFlex (MetaVar Val) [Spine] !(Cases (Thunk Val))
+  = VFlex (MetaVar (Thunk Val)) [Spine] !(Cases (Thunk Val))
   | VRigid Var [Spine] {- neutral stablizer -} !(Cases (Thunk Val))
-  | VCon (Const Val) [Spine] {- unfolding result -} !(Cases (Thunk Val))
+  | VCon (Const (Thunk Val)) [Spine] {- unfolding result -} !(Cases (Thunk Val))
 
   -- Constructors
   | VLam (Closure Var Term)
@@ -157,14 +160,14 @@ toVar :: Val -> Maybe Var
 toVar (VVar v) = Just v
 toVar _ = Nothing
 
-vMeta :: MonadMEnv m => [Spine] -> Cases (Thunk Val) -> MetaVar Val -> m Val
+vMeta :: MonadMEnv m => [Spine] -> Cases (Thunk Val) -> MetaVar (Thunk Val) -> m Val
 vMeta sp st m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . termSol)
   case sol of
     Just b -> do
-      b' <- b $$ (`zip'` subs)
+      b' <- b $$ (`zip'` map unthunk subs)
       vsol <- vSpine sp b'
-      let unfoldCase = SingleCase unfoldMeta (Thunk vsol)
+      let unfoldCase = SingleCase mempty (Thunk vsol) -- unfoldMeta
       return $ VFlex m sp $ unfoldCase <> st
     Nothing -> return $ VFlex m sp EmptyCases
 
@@ -179,11 +182,11 @@ vMetaTy st m@(MetaVar _ mid subs) = do
     Nothing -> return $ VMTyVar m st
 
 -- TODO does this need stabilization info?
-vCon :: MonadMEnv m => Env -> CofEnv -> [Spine] -> Const Val -> m Val
+vCon :: MonadMEnv m => Env -> CofEnv -> [Spine] -> Const (Thunk Val) -> m Val
 vCon env cofEnv sp c@(Const name subs) = do
   -- this does not use emptyEnv and emptyCofEnv, because
   -- the innermost evaluation needs this for the substitution to make sense
-  result <- vCon' env cofEnv (lookupGlobal env name) subs
+  result <- vCon' env cofEnv (lookupGlobal env name) (map unthunk subs)
   VCon c sp <$> mapM (\x -> Thunk <$> vSpine sp (unthunk x)) result
 
 vCon' :: MonadMEnv m =>
@@ -221,7 +224,7 @@ vApp t u = case t of
     VRigid v (VApp (Thunk u) : sp) <$> mapM (thApp u) st
   VCon c sp st ->
     VCon c (VApp (Thunk u) : sp) <$> mapM (thApp u) st
-  _ -> error "Impossible"
+  u -> error $ "vApp: Impossible " ++ show u
 
 thApp u x = Thunk <$> vApp (unthunk x) u
 
@@ -263,7 +266,7 @@ vSnd (VPair t _) = unthunk t
 vSnd (VFlex mv sp st) = VFlex mv (VSnd:sp) $ thSnd <$> st
 vSnd (VRigid v sp st) = VRigid v (VSnd:sp) $ thSnd <$> st
 vSnd (VCon c sp st) = VCon c (VSnd:sp) $ thSnd <$> st
-vSnd _ = error "Impossible"
+vSnd u = error $ "vSnd: Impossible " ++ show u
 
 thSnd = Thunk . vSnd . unthunk
 
@@ -303,9 +306,15 @@ thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 -- If the neutral form destablizes, fetch the resulting value
 -- If the metavariable produced a solution, fetch the solution too
 force :: MonadMEnv m => CofEnv -> Thunk Val -> m Val
-force cofEnv (Thunk (VFlex mv sp st))
-  | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
-  | otherwise = vMeta sp st mv
+force cofEnv (Thunk (VFlex mv sp st)) = do -- todo this is so messy and not completely forced
+  u <- vMeta sp st mv
+  case u of
+    VFlex mv sp st -> case cofSelect cofEnv st of
+      Just x -> vSpine sp =<< force cofEnv x
+      Nothing -> return u
+    _ -> error "Impossible"
+  -- | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
+  -- | otherwise = vMeta sp st mv
 force cofEnv (Thunk (VRigid _ sp st))
   | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
 force cofEnv (Thunk (VCon _ sp st))
@@ -313,9 +322,13 @@ force cofEnv (Thunk (VCon _ sp st))
 force _ (Thunk a) = return a
 
 forceTy :: MonadMEnv m => CofEnv -> Thunk TyVal -> m TyVal
-forceTy cofEnv (Thunk (VMTyVar m st))
-  | Just x <- cofSelect cofEnv st = forceTy cofEnv x
-  | otherwise = vMetaTy st m
+forceTy cofEnv (Thunk (VMTyVar m st)) = do
+  u <- vMetaTy st m
+  case u of
+    VMTyVar m st -> case cofSelect cofEnv st of
+      Just x -> forceTy cofEnv x
+      Nothing -> return u
+    _ -> error "Impossible"
 forceTy cofEnv (Thunk (VEl t)) = VEl <$> force cofEnv (Thunk t)
 forceTy _ (Thunk a) = return a
 
@@ -325,9 +338,11 @@ eval :: MonadMEnv m => Env -> CofEnv -> Term -> m Val
 eval env cofEnv = \case
   Var x -> return $ lookupLocal env x
   MVar (MetaVar name mid subs)
-    -> vMeta [] EmptyCases . MetaVar name mid =<< mapM (eval env cofEnv) subs
+    -> vMeta [] EmptyCases . MetaVar name mid . map Thunk =<<
+      mapM (eval env cofEnv) subs
   Con (Const name subs)
-    -> vCon env cofEnv [] . Const name =<< mapM (eval env cofEnv) subs
+    -> vCon env cofEnv [] . Const name . map Thunk =<<
+      mapM (eval env cofEnv) subs
   -- Let name clause body
   --   -> eval (bindGlobal name _ env) body
 
@@ -410,10 +425,10 @@ Closure env cofEnv t $$:+ r = do
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
-($$:?) :: (MonadMEnv m) => Closure () Type -> Cof -> m TyVal
-Closure env cofEnv t $$:? p = do
-  (_, s) <- unbind t
-  evalTy env (bindToken p cofEnv) s
+-- ($$:?) :: (MonadMEnv m) => Closure () Type -> Cof -> m TyVal
+-- Closure env cofEnv t $$:? p = do
+--   (_, s) <- unbind t
+--   evalTy env (bindToken p cofEnv) s
 
 ---- Reflection
 reflectSpine :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term
@@ -441,9 +456,11 @@ reify :: MonadMEnv m => CofEnv -> Val -> m Term
 -- We assume these are already forced
 reify cofEnv (VRigid v sp _) = reflectSpine cofEnv sp (Var v)
 reify cofEnv (VFlex (MetaVar name mid subs) sp _)
-  = reflectSpine cofEnv sp . MVar . MetaVar name mid =<< mapM (reify cofEnv) subs
+  = reflectSpine cofEnv sp . MVar . MetaVar name mid =<<
+    mapM (reify cofEnv <=< force cofEnv) subs
 reify cofEnv (VCon (Const name subs) sp _)
-  = reflectSpine cofEnv sp . Con . Const name =<< mapM (reify cofEnv) subs
+  = reflectSpine cofEnv sp . Con . Const name =<<
+    mapM (reify cofEnv <=< force cofEnv) subs
 
 ---- Reification
 reify _ (VLam c) = Lam <$> c $$- \x -> [(x, VVar x)]

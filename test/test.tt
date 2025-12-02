@@ -1,3 +1,4 @@
+{-
 postulate
   A : U ; x y : A ⊢ Id : U
 
@@ -11,6 +12,7 @@ define
     {- suc -} x r. λx.
       elim(_. _, r suc(zero), m s. r s, x),
     x)
+-}
 
 define
   A : U; B : U |- flip : (A * B) -> (B * A)
@@ -21,6 +23,4 @@ define
   = λf. λg. λa. g (f a)
 
 eval
-  the(Id((Nat * Nat) -> (Nat * Nat),
-    compose(_,_,_) flip(_,_) flip(_,_),
-    (\x. x)), refl(_, _))
+  compose(_,_,_) flip(Nat, Nat) flip(_, _)

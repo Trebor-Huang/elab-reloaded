@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -Wno-name-shadowing #-}
 module TypeCheck (
   TyckM, runTyckM, evalTyckM, emptyContext,
   check, checkTy, infer, conv, convTy,
@@ -16,11 +15,12 @@ import Raw
 import Syntax
 import NbE
 import Utils
+import Cofibration
 
 data Context = Context {
   env :: !Env,  -- environment for evaluation
   cofEnv :: !CofEnv,
-  vars :: [(RVar, Thunk TyVal)]  -- types of raw variables
+  rvars :: [(RVar, Thunk TyVal)]  -- types of raw variables
 } deriving Show
 
 emptyContext :: Context
@@ -29,12 +29,17 @@ emptyContext = Context emptyEnv emptyCofEnv []
 newVar :: RVar -> Var -> Thunk TyVal -> Context -> Context
 newVar vraw var ty ctx = ctx {
   env = bindLocal [(var, VVar var)] (env ctx),
-  vars = (vraw, ty) : vars ctx
+  rvars = (vraw, ty) : rvars ctx
 }
 
 bindEnv :: Var -> Val -> Context -> Context
 bindEnv var val ctx = ctx {
   env = bindLocal [(var, val)] (env ctx)
+}
+
+bindCofEnv :: Cof -> Context -> Context
+bindCofEnv p ctx = ctx {
+  cofEnv = bindToken p (cofEnv ctx)
 }
 
 declareConst :: String -> GlobalEntry
@@ -56,6 +61,16 @@ evalTyM ty = do
   Context {env = e, cofEnv = c} <- ask
   evalTy e c ty
 
+reifyM :: (MonadReader Context m, MonadMEnv m) => Val -> m Term
+reifyM tm = do
+  c <- asks cofEnv
+  reify c tm
+
+reifyTyM :: (MonadReader Context m, MonadMEnv m) => TyVal -> m Type
+reifyTyM ty = do
+  c <- asks cofEnv
+  reifyTy c ty
+
 forceM :: (MonadReader Context m, MonadMEnv m) => Thunk Val -> m Val
 forceM v = do
   c <- asks cofEnv
@@ -74,12 +89,12 @@ forceTyM v = do
 
 freshAnonMeta :: Tyck m => m (MetaVar Term)
 freshAnonMeta = do
-  vs <- asks vars
-  state <- get
-  let ix = nextMVar state
-  put state { nextMVar = ix + 1 }
+  vs <- asks rvars
+  st <- get
+  let ix = nextMVar st
+  put st { nextMVar = ix + 1 }
   return $ MetaVar
-    ("?" ++ show ix) (nextMVar state) (map (Var . coerce . fst) vs)
+    ("?" ++ show ix) (nextMVar st) (map (Var . coerce . fst) vs)
 
 insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m ()
 insertTermSol i s = do
@@ -213,7 +228,7 @@ infer (RThe rty rtm) = do
   return (The ty tm, Thunk vty)
 
 infer (RVar x) = do
-  vs <- asks vars
+  vs <- asks rvars
   case lookup x vs of
     Just y -> return (Var (coerce x), y)
     Nothing -> throwError $ "Variable out of scope: " ++ show x
@@ -325,7 +340,7 @@ expectPiSigma b ty = do
 
 convSp :: Tyck m => [Spine] -> [Spine] -> m [Equation]
 convSp [] [] = return []
-convSp (s:sp) (s':sp') = (++) <$> convSp sp sp' <*> case (s, s') of
+convSp (sp0:sp) (sp0':sp') = (++) <$> convSp sp sp' <*> case (sp0, sp0') of
   (VApp th, VApp th') -> return [Left (th, th')]
   (VFst, VFst) -> return []
   (VSnd, VSnd) -> return []
@@ -343,23 +358,24 @@ convSp (s:sp) (s':sp') = (++) <$> convSp sp sp' <*> case (s, s') of
 convSp p q = throwError $ "Not convertible: " ++ show p ++ show q
 
 conv :: Tyck m => Val -> Val -> m (Maybe [Equation])
--- rigid-rigid
-conv (VRigid v sp) (VRigid v' sp') =
+-- We assume this has been forced.
+conv (VRigid v sp _) (VRigid v' sp' _) =
   if v == v' then
     Just <$> convSp sp sp'
   else
     throwError $ "Not convertible: " ++ show v ++ " /= " ++ show v'
 -- constants that don't unfold are also rigid
-conv (VCon (Const name arg) sp Nothing) (VCon (Const name' arg') sp' Nothing) =
+conv (VCon (Const name arg) sp _) (VCon (Const name' arg') sp' _) =
   if name /= name' then
     throwError $ "Not convertible: " ++ name ++ " /= " ++ name'
   else do
-    let eq_arg = zipWith (\a b -> Left (Thunk a, Thunk b)) arg arg'
+    let eq_arg = zipWith (curry Left) arg arg'
     sp_arg <- convSp sp sp'
     return $ Just (eq_arg ++ sp_arg)
 -- rigid-flex and flex-rigid
-conv (VFlex m sp) v =
-  (\b -> if b then Just [] else Nothing) <$> solve m sp v
+conv (VFlex m sp _) v = do
+  b <- solve m sp v
+  if b then return (Just []) else return Nothing
 conv v m@VFlex {} = conv m v
 
 conv (VLam f) (VLam g) = do
@@ -399,14 +415,15 @@ conv (VQuote th1) (VQuote th2) = do
   convTy ty1 ty2
 conv (VQuote th) tm = do -- Is this necessary?
   ty <- forceTyM th
-  convTy ty (VEl (Thunk tm))
+  convTy ty (VEl tm)
 conv tm tm'@VQuote {} = conv tm' tm
 
 conv p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
 
 convTy :: Tyck m => TyVal -> TyVal -> m (Maybe [Equation])
-convTy (VMTyVar m) t =
-  (\b -> if b then Just [] else Nothing) <$> solveTy m t
+convTy (VMTyVar m _) t = do
+  b <- solveTy m t
+  if b then return (Just []) else return Nothing
 convTy t t'@VMTyVar {} = convTy t' t
 
 convTy (VSigma ty c) (VSigma ty' c') = do
@@ -417,22 +434,18 @@ convTy (VPi ty c) (VPi ty' c') -- small hack to reduce repeat
   = convTy (VSigma ty c) (VSigma ty' c')
 convTy VNat VNat = return (Just [])
 convTy VUniverse VUniverse = return (Just [])
-convTy (VEl th1) (VEl th2) = do
-  t1 <- forceM th1
-  t2 <- forceM th2
-  conv t1 t2
-convTy (VEl th1) ty = do
-  t1 <- forceM th1
-  conv t1 (VQuote (Thunk ty))
+convTy (VEl t1) (VEl t2) = conv t1 t2
+convTy (VEl t1) ty = conv t1 (VQuote (Thunk ty))
 convTy ty ty'@VEl {} = convTy ty' ty
 convTy p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
 
 -- Searches if the substitution and the spine constitutes
 -- a linear set of variables, and if so adds the solution
-solve :: Tyck m => MetaVar Val -> [Spine] -> Val -> m Bool
+solve :: Tyck m => MetaVar (Thunk Val) -> [Spine] -> Val -> m Bool
 solve (MetaVar _ mid subs) sp v = do
   vsp <- mapM spine sp
-  let vars' = sequence (map toVar subs ++ map (toVar =<<) vsp)
+  vsubs <- mapM forceM subs
+  let vars' = sequence (map toVar vsubs ++ map (toVar =<<) vsp)
   case vars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do
@@ -444,14 +457,14 @@ solve (MetaVar _ mid subs) sp v = do
     else
       return False
   where
-    spine :: MonadMEnv m => Spine -> m (Maybe Val)
+    spine :: (MonadReader Context m, MonadMEnv m) => Spine -> m (Maybe Val)
     spine (VApp s) = Just <$> forceM s
     spine _ = return Nothing
 
 solveTy :: Tyck m => MetaVar Val -> TyVal -> m Bool
 solveTy (MetaVar _ mid subs) v = do
-  let vars' = mapM toVar subs
-  case vars' of
+  let rvars' = mapM toVar subs
+  case rvars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo occurs check
@@ -468,12 +481,12 @@ solveTy (MetaVar _ mid subs) v = do
 -- (unless it's straightforward to do so)
 attempt :: Tyck m => Equation -> m (Maybe [Equation])
 attempt (Left (th1, th2)) = do
-  t1 <- force th1
-  t2 <- force th2
+  t1 <- forceM th1
+  t2 <- forceM th2
   conv t1 t2
 attempt (Right (th1, th2)) = do
-  t1 <- forceTy th1
-  t2 <- forceTy th2
+  t1 <- forceTyM th1
+  t2 <- forceTyM th2
   convTy t1 t2
 
 -- The postponing logic
@@ -498,13 +511,13 @@ zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
 zonkMeta sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$ (`zip'` vsubs)
-  reify _ val
+  zonk =<< reifyM val
 
 zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
 zonkMetaTy sol subs = do
   vsubs <- mapM evalM subs
   val <- sol $$: (`zip'` vsubs)
-  reifyTy _ val
+  zonkTy =<< reifyTyM val
 
 zonk :: Tyck m => Term -> m Term
 zonk (MVar (MetaVar name mid subs)) = do
@@ -532,6 +545,10 @@ zonk (NatElim m z s c) = do
   zs <- local (bindEnv n (VVar n) . bindEnv r (VVar r)) $ zonk s'
   zc <- zonk c
   return $ NatElim (bind x zm) zz (bind (n, r) zs) zc
+zonk (Lock p tm) = Lock p <$> zonk tm
+zonk (Unlock tm p) = (`Unlock` p) <$> zonk tm
+zonk (InCof p tm) = InCof p <$> zonk tm
+zonk (OutCof p t1 t2) = OutCof p <$> zonk t1 <*> zonk t2
 zonk (Quote ty) = Quote <$> zonkTy ty
 zonk (The ty tm) = The <$> zonkTy ty <*> zonk tm
 
@@ -552,6 +569,8 @@ zonkTy (Pi ty f) = do
   zf <- local (bindEnv x (VVar x)) $ zonkTy f'
   return $ Pi zty $ bind x zf
 zonkTy Nat = return Nat
+zonkTy (Pushforward p ty) = Pushforward p <$> zonkTy ty
+zonkTy (Ext ty p tm) = (`Ext` p) <$> zonkTy ty <*> zonk tm
 zonkTy Universe = return Universe
 zonkTy (El tm) = El <$> zonk tm
 
@@ -559,10 +578,10 @@ zonkTy (El tm) = El <$> zonk tm
 processFile :: Tyck m => [(RawJudgment, String)] -> Raw -> m (Type, Term, Term)
 processFile [] expr = do
   (tm, vty) <- infer expr
-  ty <- reifyTy UnfoldMeta =<< forceTy vty
   vtm <- evalM tm
   ztm <- zonk tm
-  ntm <- reify UnfoldDef vtm
+  ty <- reifyTyM =<< forceTyM vty
+  ntm <- reifyM vtm -- =<< forceM (Thunk vtm)
   return (ty, ztm, ntm)
 processFile ((rj,name):decl) expr = do
   j <- checkJudgment rj

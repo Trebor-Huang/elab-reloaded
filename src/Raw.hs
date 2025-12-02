@@ -53,7 +53,7 @@ data ParseTree
   deriving Show
 
 spaceEater :: Parser ()
-spaceEater = L.space C.space1 (L.skipLineComment "--") (L.skipBlockComment "{-" "-}")
+spaceEater = L.space C.space1 (L.skipLineComment "--") (L.skipBlockCommentNested "{-" "-}")
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme spaceEater
