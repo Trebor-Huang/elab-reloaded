@@ -136,21 +136,19 @@ showTypeM i = \case
   MTyVar (MetaVar name _ subs) ->
     (\tms -> showString name . showList__ id tms) <$>
     mapM (showTermM 0) subs
-  Sigma t1 t2 -> do
-    s1 <- showTypeM 0 t1
-    lunbind t2 \(x, t') -> do
+  Sigma t1 t2 -> lunbind t2 \(x, t') -> do
       s2 <- showTypeM 0 t'
+      s1 <- if occurs x t' then showTypeM 0 t1 else showTypeM 1 t1
       return (showParen (i > 0) $
-        (if occurs x t' then
+        (if occurs x t' then do
           showParen True (shows x . showString " : " . s1)
         else s1) .
         showString " × " . s2)
-  Pi t1 t2 -> do
-    s1 <- showTypeM 0 t1
-    lunbind t2 \(x, t') -> do
+  Pi t1 t2 -> lunbind t2 \(x, t') -> do
       s2 <- showTypeM 0 t'
+      s1 <- if occurs x t' then showTypeM 0 t1 else showTypeM 1 t1
       return (showParen (i > 0) $
-        (if occurs x t' then
+        (if occurs x t' then do
           showParen True (shows x . showString " : " . s1)
         else s1) .
         showString " → " . s2)
