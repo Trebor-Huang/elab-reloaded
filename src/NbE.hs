@@ -22,6 +22,7 @@ import Syntax
 import Cofibration
 import Utils
 import Control.Monad ((<=<))
+import Debug.Trace (trace)
 
 -- todo check if all the monad assumptions are required
 --- Environment
@@ -106,7 +107,9 @@ instance (Show r, Show t) => Show (Closure r t) where
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
 -- make the input type a Thunk. Generally always make the output Thunk.
-newtype Thunk a = Thunk { unthunk :: a } deriving Show
+newtype Thunk a = Thunk { unthunk :: a }
+instance Show a => Show (Thunk a) where
+  showsPrec i (Thunk a) = showsPrec i a
 -- use unthunk to disregard this, and use force to make the update
 
 -- Eliminators
@@ -167,7 +170,8 @@ vMeta sp st m@(MetaVar _ mid subs) = do
     Just b -> do
       b' <- b $$ (`zip'` map unthunk subs)
       vsol <- vSpine sp b'
-      let unfoldCase = SingleCase mempty (Thunk vsol) -- unfoldMeta
+      let unfoldCase = SingleCase mempty (Thunk vsol)
+        -- todo add back unfolding meta
       return $ VFlex m sp $ unfoldCase <> st
     Nothing -> return $ VFlex m sp EmptyCases
 
@@ -177,7 +181,7 @@ vMetaTy st m@(MetaVar _ mid subs) = do
   case sol of
     Just b -> do
       vsol <- b $$: (`zip'` subs)
-      let unfoldCase = SingleCase unfoldMeta (Thunk vsol)
+      let unfoldCase = SingleCase mempty (Thunk vsol)
       return $ VMTyVar m $ unfoldCase <> st
     Nothing -> return $ VMTyVar m st
 
@@ -205,10 +209,10 @@ vCon' _ _ _ _ = error "Impossible"
 
 vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
 vSpine [] v = return v
-vSpine (c:sp) v0 = do
+vSpine sps@(c:sp) v0 = trace ("vSpine: " ++ show sps ++ "\n> " ++ show v0) do
   v <- vSpine sp v0
   case c of
-    VApp th -> vApp (unthunk th) v
+    VApp th -> vApp v (unthunk th)
     VFst -> return $ vFst v
     VSnd -> return $ vSnd v
     VNatElim m z s -> vNatElim m z s v
@@ -216,17 +220,17 @@ vSpine (c:sp) v0 = do
     VOutCof p u -> return $ vOutCof p u v
 
 vApp :: MonadMEnv m => Val -> Val -> m Val
-vApp t u = case t of
-  VLam t' -> t' $$ \x -> [(x, u)]
+vApp fun arg = case fun of
+  VLam t' -> t' $$ \x -> [(x, arg)]
   VFlex mv sp st ->
-    VFlex mv (VApp (Thunk u) : sp) <$> mapM (thApp u) st
+    VFlex mv (VApp (Thunk arg) : sp) <$> mapM (thApp arg) st
   VRigid v sp st ->
-    VRigid v (VApp (Thunk u) : sp) <$> mapM (thApp u) st
+    VRigid v (VApp (Thunk arg) : sp) <$> mapM (thApp arg) st
   VCon c sp st ->
-    VCon c (VApp (Thunk u) : sp) <$> mapM (thApp u) st
+    VCon c (VApp (Thunk arg) : sp) <$> mapM (thApp arg) st
   u -> error $ "vApp: Impossible " ++ show u
 
-thApp u x = Thunk <$> vApp (unthunk x) u
+thApp arg fun = Thunk <$> vApp (unthunk fun) arg
 
 vUnlock :: MonadMEnv m => Val -> Cof -> m Val
 vUnlock t p = case t of
@@ -262,7 +266,7 @@ vFst _ = error "Impossible"
 
 thFst = Thunk . vFst . unthunk
 
-vSnd (VPair t _) = unthunk t
+vSnd (VPair _ t) = unthunk t
 vSnd (VFlex mv sp st) = VFlex mv (VSnd:sp) $ thSnd <$> st
 vSnd (VRigid v sp st) = VRigid v (VSnd:sp) $ thSnd <$> st
 vSnd (VCon c sp st) = VCon c (VSnd:sp) $ thSnd <$> st
@@ -307,25 +311,23 @@ thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 -- If the metavariable produced a solution, fetch the solution too
 force :: MonadMEnv m => CofEnv -> Thunk Val -> m Val
 force cofEnv (Thunk (VFlex mv sp st)) = do -- todo this is so messy and not completely forced
-  u <- vMeta sp st mv
+  u <- vMeta sp st mv -- todo this may also repeat solutions
   case u of
-    VFlex mv sp st -> case cofSelect cofEnv st of
-      Just x -> vSpine sp =<< force cofEnv x
+    VFlex _ _ st -> case cofSelect cofEnv st of
+      Just x -> force cofEnv x
       Nothing -> return u
     _ -> error "Impossible"
-  -- | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
-  -- | otherwise = vMeta sp st mv
-force cofEnv (Thunk (VRigid _ sp st))
-  | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
-force cofEnv (Thunk (VCon _ sp st))
-  | Just x <- cofSelect cofEnv st = vSpine sp =<< force cofEnv x
+force cofEnv (Thunk (VRigid _ _ st))
+  | Just x <- cofSelect cofEnv st = force cofEnv x
+force cofEnv (Thunk (VCon _ _ st))
+  | Just x <- cofSelect cofEnv st = force cofEnv x
 force _ (Thunk a) = return a
 
 forceTy :: MonadMEnv m => CofEnv -> Thunk TyVal -> m TyVal
 forceTy cofEnv (Thunk (VMTyVar m st)) = do
   u <- vMetaTy st m
   case u of
-    VMTyVar m st -> case cofSelect cofEnv st of
+    VMTyVar _ st -> case cofSelect cofEnv st of
       Just x -> forceTy cofEnv x
       Nothing -> return u
     _ -> error "Impossible"
@@ -377,7 +379,10 @@ eval env cofEnv = \case
   InCof p t -> do
     v <- eval env cofEnv t
     return $ VInCof p (Thunk v)
-  OutCof p u t -> vOutCof p <$> (Thunk <$> eval env cofEnv u) <*> eval env cofEnv t
+  OutCof p u t -> do
+    vu <- eval env cofEnv u
+    vt <- eval env cofEnv t
+    return $ vOutCof p (Thunk vu) vt
 
   Quote ty -> VQuote . Thunk <$> evalTy env cofEnv ty
   The _ tm -> eval env cofEnv tm
@@ -504,27 +509,27 @@ reifyTy cofEnv (VEl tm) = El <$> reify cofEnv tm
 Closure env cofEnv t $$- r = do
   (x, s) <- unbind t
   s' <- eval (bindLocal (r x) env) cofEnv s
-  t' <- reify cofEnv s'
+  t' <- reify cofEnv =<< force cofEnv (Thunk s')
   return (bind x t')
 
 ($$:-) :: (MonadMEnv m, Alpha p) => Closure p Type -> (p -> [(Var, Val)]) -> m (Bind p Type)
 Closure env cofEnv t $$:- r = do
   (x, s) <- unbind t
   s' <- evalTy (bindLocal (r x) env) cofEnv s
-  t' <- reifyTy cofEnv s'
+  t' <- reifyTy cofEnv =<< forceTy cofEnv (Thunk s')
   return (bind x t')
 
 ($$?-) :: MonadMEnv m => Closure () Term -> Cof -> m Term
 Closure env cofEnv t $$?- p = do
   (_, s) <- unbind t
   s' <- eval env (bindToken p cofEnv) s
-  reify (bindToken p cofEnv) s'
+  reify (bindToken p cofEnv) =<< force (bindToken p cofEnv) (Thunk s')
 
 ($$:?-) :: MonadMEnv m => Closure () Type -> Cof -> m Type
 Closure env cofEnv t $$:?- p = do
   (_, s) <- unbind t
   s' <- evalTy env (bindToken p cofEnv) s
-  reifyTy (bindToken p cofEnv) s'
+  reifyTy (bindToken p cofEnv) =<< forceTy (bindToken p cofEnv) (Thunk s')
 
 ---- Example monad to use the functions ----
 type MetaEnvM = StateT MetaEnv FreshM

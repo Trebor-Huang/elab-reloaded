@@ -409,6 +409,8 @@ conv (VSuc n th) (VSuc m th') =
   else
     throwError $ show n ++ " /= " ++ show m
 
+-- todo Lock, InCof
+
 conv (VQuote th1) (VQuote th2) = do
   ty1 <- forceTyM th1
   ty2 <- forceTyM th2
@@ -580,8 +582,9 @@ processFile [] expr = do
   (tm, vty) <- infer expr
   vtm <- evalM tm
   ztm <- zonk tm
+  -- You probably need to force whenever metas could be solved
   ty <- reifyTyM =<< forceTyM vty
-  ntm <- reifyM vtm -- =<< forceM (Thunk vtm)
+  ntm <- reifyM =<< forceM (Thunk vtm)
   return (ty, ztm, ntm)
 processFile ((rj,name):decl) expr = do
   j <- checkJudgment rj

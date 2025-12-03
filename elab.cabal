@@ -38,7 +38,7 @@ library
   hs-source-dirs:
       src
   default-extensions:
-      DeriveGeneric GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
+      DeriveGeneric DeriveTraversable GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
@@ -58,7 +58,7 @@ executable elab-exe
   hs-source-dirs:
       app
   default-extensions:
-      DeriveGeneric GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
+      DeriveGeneric DeriveTraversable GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
@@ -76,7 +76,7 @@ test-suite elab-test
   hs-source-dirs:
       test
   default-extensions:
-      DeriveGeneric GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
+      DeriveGeneric DeriveTraversable GeneralizedNewtypeDeriving MultiParamTypeClasses LambdaCase BlockArguments FlexibleContexts FlexibleInstances OverloadedStrings PatternSynonyms
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5

@@ -1,8 +1,7 @@
-{-# LANGUAGE DeriveTraversable #-}
 module Cofibration (
   Atom,
   World, emptyWorld,
-  Cof, implies, fromAtom, unfoldMeta,
+  Cof, implies, fromAtom,
   Cases, pattern EmptyCases, pattern SingleCase, select) where
 import qualified Data.IntMap as IM
 import qualified Data.IntSet as IS
@@ -21,7 +20,6 @@ instance Ord Atom where
 instance Show Atom where
   show (Atom p _) = p
 
--- todo more efficient data structures
 data World = World {
   atoms :: IM.IntMap String,
   relations :: IM.IntMap Cof,
@@ -44,9 +42,6 @@ instance Monoid Cof where
 
 fromAtom :: Atom -> Cof
 fromAtom (Atom s i) = Cof (ignore $ IM.singleton i s)
-
-unfoldMeta :: Cof
-unfoldMeta = fromAtom $ Atom "?" (-1)
 
 --         W     ;  Phi |- Psi true
 implies :: World -> Cof -> Cof -> Bool
@@ -75,4 +70,5 @@ select w p (Cases ((q,a):cs)) =
   else
     select w p (Cases cs)
 
+-- todo more efficient data structures
 -- todo is it possible to simplify but not evaluate the branches?
