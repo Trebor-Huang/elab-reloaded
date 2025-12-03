@@ -1,11 +1,11 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 module NbE (
   GlobalEntry(..), Env(..), emptyEnv, CofEnv(..), emptyCofEnv,
-  bindLocal, lookupLocal, bindGlobal, lookupGlobal, bindToken,
+  bindLocal, bindGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
-  Closure(..), Spine(..),
+  Closure, closeB, Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
-  vApp, vFst, vSnd, vSuc, vNatElim, vSpine, vCon,
+  vApp, vFst, vSnd, -- vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
   reify, reifyTy, reflectSpine, nf,
@@ -22,7 +22,7 @@ import Syntax
 import Cofibration
 import Utils
 import Control.Monad ((<=<))
-import Debug.Trace (trace)
+import Control.Lens (anyOf)
 
 -- todo check if all the monad assumptions are required
 --- Environment
@@ -103,6 +103,10 @@ class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
 data Closure r t = Closure Env CofEnv (Bind r t)
 instance (Show r, Show t) => Show (Closure r t) where
   show (Closure _ _ b) = show b
+closeB :: (Alpha r, Alpha t) => Env -> CofEnv -> Bind r t -> Closure r t
+closeB env cofEnv b = Closure (env {
+  localEnv = M.filterWithKey (\k _ -> anyOf fv (== k) b) (localEnv env)
+}) cofEnv b
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
@@ -209,7 +213,7 @@ vCon' _ _ _ _ = error "Impossible"
 
 vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
 vSpine [] v = return v
-vSpine sps@(c:sp) v0 = trace ("vSpine: " ++ show sps ++ "\n> " ++ show v0) do
+vSpine (c:sp) v0 = do
   v <- vSpine sp v0
   case c of
     VApp th -> vApp v (unthunk th)
@@ -348,7 +352,7 @@ eval env cofEnv = \case
   -- Let name clause body
   --   -> eval (bindGlobal name _ env) body
 
-  Lam s -> return $ VLam $ Closure env cofEnv s
+  Lam s -> return $ VLam $ closeB env cofEnv s
   App t1 t2 -> do
     v1 <- eval env cofEnv t1
     v2 <- eval env cofEnv t2
@@ -366,12 +370,12 @@ eval env cofEnv = \case
   NatElim m z s t -> do
     v <- eval env cofEnv t
     vNatElim
-      (Closure env cofEnv m)
-      (Closure env cofEnv (bind () z))
-      (Closure env cofEnv s)
+      (closeB env cofEnv m)
+      (closeB env cofEnv (bind () z))
+      (closeB env cofEnv s)
       v
 
-  Lock p t -> return $ VLock p $ Closure env cofEnv (bind () t)
+  Lock p t -> return $ VLock p $ closeB env cofEnv (bind () t)
   Unlock t p -> do
     v <- eval env (bindToken p cofEnv) t
     vUnlock v p
@@ -393,15 +397,15 @@ evalTy env cofEnv = \case
     -> vMetaTy EmptyCases . MetaVar name mid =<< mapM (eval env cofEnv) subs
   Sigma t1 t2 -> do
     v1 <- evalTy env cofEnv t1
-    return $ VSigma (Thunk v1) (Closure env cofEnv t2)
+    return $ VSigma (Thunk v1) (closeB env cofEnv t2)
   Pi t1 t2 -> do
     v1 <- evalTy env cofEnv t1
-    return $ VPi (Thunk v1) (Closure env cofEnv t2)
+    return $ VPi (Thunk v1) (closeB env cofEnv t2)
   Nat -> return VNat
-  Pushforward p ty -> return $ VPushforward p (Closure env cofEnv (bind () ty))
+  Pushforward p ty -> return $ VPushforward p (closeB env cofEnv (bind () ty))
   Ext ty p tm -> do
     vty <- evalTy env cofEnv ty
-    return $ VExt (Thunk vty) p (Closure env cofEnv (bind () tm))
+    return $ VExt (Thunk vty) p (closeB env cofEnv (bind () tm))
   Universe -> return VUniverse
   El t -> vEl <$> eval env cofEnv t
 
@@ -429,11 +433,6 @@ Closure env cofEnv t $$:+ r = do
 
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
-
--- ($$:?) :: (MonadMEnv m) => Closure () Type -> Cof -> m TyVal
--- Closure env cofEnv t $$:? p = do
---   (_, s) <- unbind t
---   evalTy env (bindToken p cofEnv) s
 
 ---- Reflection
 reflectSpine :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term

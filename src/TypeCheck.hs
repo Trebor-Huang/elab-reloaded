@@ -15,7 +15,6 @@ import Raw
 import Syntax
 import NbE
 import Utils
-import Cofibration
 
 data Context = Context {
   env :: !Env,  -- environment for evaluation
@@ -37,10 +36,10 @@ bindEnv var val ctx = ctx {
   env = bindLocal [(var, val)] (env ctx)
 }
 
-bindCofEnv :: Cof -> Context -> Context
-bindCofEnv p ctx = ctx {
-  cofEnv = bindToken p (cofEnv ctx)
-}
+-- bindCofEnv :: Cof -> Context -> Context
+-- bindCofEnv p ctx = ctx {
+--   cofEnv = bindToken p (cofEnv ctx)
+-- }
 
 declareConst :: String -> GlobalEntry
   -> Context -> Context
@@ -109,19 +108,19 @@ insertTypeSol i s = do
     typeSol = IM.insert i s (typeSol menv)
   }
 
-close :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
-close a th = do
+closeM :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
+closeM a th = do
   t <- forceM th
   ctx <- ask
   tm <- reify (cofEnv ctx) t
-  return $ Closure (env ctx) (cofEnv ctx) (bind a tm)
+  return $ closeB (env ctx) (cofEnv ctx) (bind a tm)
 
-closeTy :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
-closeTy a th = do
+closeTyM :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
+closeTyM a th = do
   t <- forceTyM th
   ctx <- ask
   ty <- reifyTy (cofEnv ctx) t
-  return (Closure (env ctx) (cofEnv ctx) (bind a ty))
+  return (closeB (env ctx) (cofEnv ctx) (bind a ty))
 
 check :: Tyck m => Raw -> TyVal -> m Term
 check RHole _ = -- todo typed holes
@@ -251,7 +250,7 @@ infer (RLam f) = do
   (x, rt) <- unbind f
   let x' = coerce x :: Var
   (t, vcod) <- local (newVar x x' vdom) $ infer rt
-  cod <- closeTy x' vcod
+  cod <- closeTyM x' vcod
   return (Lam $ bind x' t, Thunk $ VPi vdom cod)
 infer rty@RPi {} = do
   ty <- checkTy rty
@@ -281,7 +280,7 @@ infer (RPair t1 t2) = do
   bt2 <- local (bindEnv z (VVar z)) do
     mt2 <- freshAnonMeta
     evalTyM (MTyVar mt2)
-  ty2 <- closeTy z (Thunk bt2)
+  ty2 <- closeTyM z (Thunk bt2)
   let ty = VSigma (Thunk ty1) ty2
   t <- check (RPair t1 t2) ty
   return (t, Thunk ty)
@@ -329,7 +328,7 @@ expectPiSigma b ty = do
   bcod <- local (bindEnv z (VVar z)) do
     mcod <- freshAnonMeta
     evalTyM (MTyVar mcod)
-  cod <- closeTy z (Thunk bcod)
+  cod <- closeTyM z (Thunk bcod)
   unify [Right (Thunk ty,
     Thunk $ (if b then VPi else VSigma) (Thunk dom) cod)]
   return (dom, cod)
@@ -453,7 +452,7 @@ solve (MetaVar _ mid subs) sp v = do
     Just vars -> if allUnique vars then do
       -- todo occurs check
       -- todo this causes a tiny of rechecking
-      sol <- close vars (Thunk v)
+      sol <- closeM vars (Thunk v)
       insertTermSol mid sol
       return True
     else
@@ -471,7 +470,7 @@ solveTy (MetaVar _ mid subs) v = do
     Just vars -> if allUnique vars then do
       -- todo occurs check
       -- todo this causes a tiny of rechecking
-      sol <- closeTy vars (Thunk v)
+      sol <- closeTyM vars (Thunk v)
       insertTypeSol mid sol
       return True
     else
