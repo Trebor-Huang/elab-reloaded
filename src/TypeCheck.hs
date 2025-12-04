@@ -9,6 +9,7 @@ import Control.Monad.Reader
 import Unbound.Generics.LocallyNameless hiding (close)
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
+import qualified Data.IntSet as IS
 import Data.Coerce (coerce)
 
 import Raw
@@ -90,23 +91,39 @@ freshAnonMeta :: Tyck m => m (MetaVar Term)
 freshAnonMeta = do
   vs <- asks rvars
   st <- get
-  let ix = nextMVar st
-  put st { nextMVar = ix + 1 }
+  let (ix, g) = newNode $ graph st
+  put st { graph = g }
   return $ MetaVar
-    ("?" ++ show ix) (nextMVar st) (map (Var . coerce . fst) vs)
+    ("?" ++ show ix) ix (map (Var . coerce . fst) vs)
 
-insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m ()
+insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m Bool
 insertTermSol i s = do
-  -- todo debug check if metavariables are repeated
-  modify \menv -> menv {
-    termSol = IM.insert i s (termSol menv)
-  }
+  -- todo better error reporting
+  menv <- get
+  let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getMetas s)
+  if hasCycle newGraph then
+    return False
+  else do
+    put menv {
+      termSol = IM.insertWith (error "Repeated solution")
+        i s (termSol menv),
+      graph = newGraph
+    }
+    return True
 
-insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m ()
+insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m Bool
 insertTypeSol i s = do
-  modify \menv -> menv {
-    typeSol = IM.insert i s (typeSol menv)
-  }
+  menv <- get
+  let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getTyMetas s)
+  if hasCycle newGraph then
+    return False
+  else do
+    put menv {
+      typeSol = IM.insertWith (error "Repeated solution")
+        i s (typeSol menv),
+      graph = newGraph
+    }
+    return True
 
 closeM :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 closeM a th = do
@@ -123,7 +140,7 @@ closeTyM a th = do
   return (closeB (env ctx) (cofEnv ctx) (bind a ty))
 
 check :: Tyck m => Raw -> TyVal -> m Term
-check RHole _ = -- todo typed holes
+check RHole _ =
   MVar <$> freshAnonMeta
 
 check (RLam f) (VPi thdom cod) = do
@@ -188,7 +205,7 @@ checkJudgment (Hypo rty bj) = do
   return $ Hypothetic ty $ bind x' entry
 
 infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
-infer RHole = do -- todo typed holes
+infer RHole = do
   m <- freshAnonMeta
   mty <- freshAnonMeta
   vty <- evalTyM (MTyVar mty)
@@ -372,6 +389,7 @@ conv (VCon (Const name arg) sp _) (VCon (Const name' arg') sp' _) =
     sp_arg <- convSp sp sp'
     return $ Just (eq_arg ++ sp_arg)
 -- rigid-flex and flex-rigid
+-- todo filter out if v is actually just m
 conv (VFlex m sp _) v = do
   b <- solve m sp v
   if b then return (Just []) else return Nothing
@@ -450,11 +468,9 @@ solve (MetaVar _ mid subs) sp v = do
   case vars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do
-      -- todo occurs check
       -- todo this causes a tiny of rechecking
       sol <- closeM vars (Thunk v)
       insertTermSol mid sol
-      return True
     else
       return False
   where
@@ -469,11 +485,9 @@ solveTy (MetaVar _ mid subs) v = do
   case rvars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do
-      -- todo occurs check
       -- todo this causes a tiny of rechecking
       sol <- closeTyM vars (Thunk v)
       insertTypeSol mid sol
-      return True
     else
       return False
 
@@ -589,6 +603,7 @@ processFile [] expr = do
 processFile ((rj,name):decl) expr = do
   j <- checkJudgment rj
   local (declareConst name j) $ processFile decl expr
+  -- todo freeze metas
 
 ----- Example monad to use functions ----
 type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))

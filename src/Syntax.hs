@@ -1,10 +1,13 @@
 module Syntax (
   Var, MetaVar(..), Const(..),
-  Term(..), Type(..)
+  Term(..), Type(..),
+  getMetas, getTyMetas
 ) where
 import Unbound.Generics.LocallyNameless
+import Unbound.Generics.LocallyNameless.Unsafe (unsafeUnbind)
 import GHC.Generics (Generic)
 import Control.Lens (anyOf)
+import qualified Data.IntSet as IS
 
 import Cofibration
 import Utils
@@ -185,3 +188,40 @@ instance Subst Term Type
 
 instance Subst Term (MetaVar Term)
 instance Subst Term (Const Term)
+
+getMetas :: Term -> IS.IntSet
+getMetas (Var _) = IS.empty
+getMetas (MVar (MetaVar _ mid subs)) =
+  IS.singleton mid `IS.union` IS.unions (map getMetas subs)
+getMetas (Con (Const _ subs)) = IS.unions (map getMetas subs)
+getMetas (Lam f) = getMetas (snd $ unsafeUnbind f)
+getMetas (App s t) = getMetas s `IS.union` getMetas t
+getMetas (Pair s t) = getMetas s `IS.union` getMetas t
+getMetas (Fst s) = getMetas s
+getMetas (Snd s) = getMetas s
+getMetas Zero = IS.empty
+getMetas (Suc s) = getMetas s
+getMetas (NatElim b1 t1 b2 t2) =
+  getTyMetas (snd $ unsafeUnbind b1) `IS.union`
+  getMetas t1 `IS.union`
+  getMetas (snd $ unsafeUnbind b2) `IS.union`
+  getMetas t2
+getMetas (Lock _ t) = getMetas t
+getMetas (Unlock t _) = getMetas t
+getMetas (InCof _ t) = getMetas t
+getMetas (OutCof _ t s) = getMetas t `IS.union` getMetas s
+getMetas (Quote ty) = getTyMetas ty
+getMetas (The ty tm) = getTyMetas ty `IS.union` getMetas tm
+
+getTyMetas :: Type -> IS.IntSet
+getTyMetas (MTyVar (MetaVar _ mid subs)) =
+  IS.singleton mid `IS.union` IS.unions (map getMetas subs)
+getTyMetas (Sigma t1 t2) =
+  getTyMetas t1 `IS.union` getTyMetas (snd $ unsafeUnbind t2)
+getTyMetas (Pi t1 t2) =
+  getTyMetas t1 `IS.union` getTyMetas (snd $ unsafeUnbind t2)
+getTyMetas Nat = IS.empty
+getTyMetas (Pushforward _ t) = getTyMetas t
+getTyMetas (Ext ty _ tm) = getTyMetas ty `IS.union` getMetas tm
+getTyMetas Universe = IS.empty
+getTyMetas (El t) = getMetas t

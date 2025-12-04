@@ -3,7 +3,7 @@ module NbE (
   GlobalEntry(..), Env(..), emptyEnv, CofEnv(..), emptyCofEnv,
   bindLocal, bindGlobal,
   Equation, MetaEnv(..), emptyMetaEnv,
-  Closure, closeB, Spine(..),
+  Closure, closeB, getClosureMetas, Spine(..),
   Val(.. {- exclude VNeutral -}, VVar), toVar,
   vApp, vFst, vSnd, -- vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
@@ -13,16 +13,19 @@ module NbE (
 ) where
 
 import qualified Data.IntMap as IM
+import qualified Data.IntSet as IS
 import qualified Data.Map as M
+import qualified Data.Graph as G
 import Control.Monad.State
+import Control.Monad ((<=<))
+import Control.Lens (anyOf)
 import GHC.Generics
 import Unbound.Generics.LocallyNameless
+import Unbound.Generics.LocallyNameless.Unsafe (unsafeUnbind)
 
 import Syntax
 import Cofibration
 import Utils
-import Control.Monad ((<=<))
-import Control.Lens (anyOf)
 
 -- todo check if all the monad assumptions are required
 --- Environment
@@ -87,14 +90,15 @@ cofSelect e = select (globalTokens e) (localTokens e)
 type Equation = Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)
 
 data MetaEnv = MetaEnv {
-  nextMVar :: Int,
   termSol :: IM.IntMap (Closure [Var] Term),
   typeSol :: IM.IntMap (Closure [Var] Type),
-  equations :: [Equation]  -- postponed equations
+  equations :: [Equation],  -- postponed equations
+  graph :: G.Graph
 } deriving Show
 
 emptyMetaEnv :: MetaEnv
-emptyMetaEnv = MetaEnv 0 IM.empty IM.empty []
+emptyMetaEnv = MetaEnv IM.empty IM.empty []
+  (G.buildG (0,-1) [])
 
 class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
 
@@ -107,6 +111,10 @@ closeB :: (Alpha r, Alpha t) => Env -> CofEnv -> Bind r t -> Closure r t
 closeB env cofEnv b = Closure (env {
   localEnv = M.filterWithKey (\k _ -> anyOf fv (== k) b) (localEnv env)
 }) cofEnv b
+getClosureMetas :: (Alpha r, Alpha p) => (p -> IS.IntSet) -> Closure r p -> IS.IntSet
+getClosureMetas f (Closure env _ b) =
+  M.foldMapWithKey (const getValMetas) (localEnv env) `IS.union`
+  f (snd $ unsafeUnbind b)
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
 -- Principle: if we immediately want to case split on the variable, then
@@ -126,6 +134,17 @@ data Spine
   deriving Show
 -- There should be a TySpine in principle but it's just VEl by itself...
 
+getSpineMetas :: Spine -> IS.IntSet
+getSpineMetas (VApp (Thunk v)) = getValMetas v
+getSpineMetas VFst = IS.empty
+getSpineMetas VSnd = IS.empty
+getSpineMetas (VNatElim c1 c2 c3) =
+  getClosureMetas getTyMetas c1 `IS.union`
+  getClosureMetas getMetas c2 `IS.union`
+  getClosureMetas getMetas c3
+getSpineMetas (VUnlock _) = IS.empty
+getSpineMetas (VOutCof _ (Thunk v)) = getValMetas v
+
 data Val
   -- todo these three leads to a lot of repeated clauses
   = VFlex (MetaVar (Thunk Val)) [Spine] !(Cases (Thunk Val))
@@ -140,6 +159,23 @@ data Val
   | VInCof Cof (Thunk Val)
   | VQuote (Thunk TyVal)
   deriving Show
+
+getValMetas :: Val -> IS.IntSet
+getValMetas (VFlex (MetaVar _ mid _) sp _) =
+  IS.singleton mid `IS.union`
+  IS.unions (map getSpineMetas sp)
+getValMetas (VRigid _ sp _) = IS.unions (map getSpineMetas sp)
+getValMetas (VCon (Const _ subs) sp _) =
+  IS.unions (map (getValMetas . unthunk) subs) `IS.union`
+  IS.unions (map getSpineMetas sp)
+getValMetas (VLam c) = getClosureMetas getMetas c
+getValMetas (VPair (Thunk a) (Thunk b)) =
+  getValMetas a `IS.union` getValMetas b
+getValMetas VZero = IS.empty
+getValMetas (VSuc _ (Thunk v)) = getValMetas v
+getValMetas (VLock _ c) = getClosureMetas getMetas c
+getValMetas (VInCof _ (Thunk v)) = getValMetas v
+getValMetas (VQuote (Thunk v)) = getTyValMetas v
 
 data TyVal
   = VMTyVar (MetaVar (Thunk Val)) !(Cases (Thunk TyVal))
@@ -157,6 +193,19 @@ data TyVal
   -- Ext
   | VUniverse
   deriving Show
+
+getTyValMetas :: TyVal -> IS.IntSet
+getTyValMetas (VMTyVar (MetaVar _ mid _) _) = IS.singleton mid
+getTyValMetas (VEl v) = getValMetas v
+getTyValMetas (VSigma (Thunk v) c) =
+  getTyValMetas v `IS.union` getClosureMetas getTyMetas c
+getTyValMetas (VPi (Thunk v) c) =
+  getTyValMetas v `IS.union` getClosureMetas getTyMetas c
+getTyValMetas VNat = IS.empty
+getTyValMetas (VPushforward _ c) = getClosureMetas getTyMetas c
+getTyValMetas (VExt (Thunk v) _ c) =
+  getTyValMetas v `IS.union` getClosureMetas getMetas c
+getTyValMetas VUniverse = IS.empty
 
 -- Patterns for constructing values.
 -- These should not look under metas, so they use "unthunk"
