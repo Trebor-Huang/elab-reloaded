@@ -24,7 +24,7 @@ define
   A : U; n : Nat |- repeat : (A -> A) -> (A -> A)
   = \f. elim(_. _,
     \x. x,
-    n r. \x. f (r x), -- todo adding \f here should be an error
+    n r. \g. \x. f (r x), -- todo adding \f here should be an error
     n
   )
 

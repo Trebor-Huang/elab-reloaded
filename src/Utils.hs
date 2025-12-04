@@ -24,7 +24,7 @@ showList__ showx (x:xs) s = '[' : showx x (showl xs)
     showl (y:ys) = ", " ++ showx y (showl ys)
 
 hasCycle :: G.Graph -> Bool
-hasCycle g = any (\c -> length c > 1) (G.scc g)
+hasCycle g = any (uncurry (==)) (G.edges g) || any (\c -> length c > 1) (G.scc g)
 
 insertNode :: G.Graph -> Int -> [Int] -> G.Graph
 insertNode g i k = g A.// [(i, k)]

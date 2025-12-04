@@ -16,6 +16,7 @@ import Raw
 import Syntax
 import NbE
 import Utils
+import Debug.Trace (trace)
 
 data Context = Context {
   env :: !Env,  -- environment for evaluation
@@ -48,7 +49,7 @@ declareConst name val ctx = ctx {
   env = bindGlobal name val (env ctx)
 }
 
-class (MonadError String m, MonadReader Context m, MonadMEnv m) => Tyck m
+class (MonadReader Context m, MonadMEnv m) => Tyck m
 
 -- Prepare some primitive operations
 evalM :: (MonadReader Context m, MonadMEnv m) => Term -> m Val
@@ -96,34 +97,32 @@ freshAnonMeta = do
   return $ MetaVar
     ("?" ++ show ix) ix (map (Var . coerce . fst) vs)
 
-insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m Bool
-insertTermSol i s = do
+insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m ()
+insertTermSol i s = trace (show i ++ " == " ++ show s) do
   -- todo better error reporting
   menv <- get
   let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getMetas s)
-  if hasCycle newGraph then
-    return False
+  trace (show newGraph) if hasCycle newGraph then
+    throwError "Occurs check"
   else do
     put menv {
       termSol = IM.insertWith (error "Repeated solution")
         i s (termSol menv),
       graph = newGraph
     }
-    return True
 
-insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m Bool
-insertTypeSol i s = do
+insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m ()
+insertTypeSol i s = trace (show i ++ " :== " ++ show s) do
   menv <- get
   let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getTyMetas s)
   if hasCycle newGraph then
-    return False
+    throwError "Occurs check"
   else do
     put menv {
       typeSol = IM.insertWith (error "Repeated solution")
         i s (typeSol menv),
       graph = newGraph
     }
-    return True
 
 closeM :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 closeM a th = do
@@ -389,7 +388,8 @@ conv (VCon (Const name arg) sp _) (VCon (Const name' arg') sp' _) =
     sp_arg <- convSp sp sp'
     return $ Just (eq_arg ++ sp_arg)
 -- rigid-flex and flex-rigid
--- todo filter out if v is actually just m
+conv (VFlex (MetaVar _ mid _) _ _) (VFlex (MetaVar _ mid' _) _ _)
+  | mid == mid' = return Nothing -- todo deal with it properly
 conv (VFlex m sp _) v = do
   b <- solve m sp v
   if b then return (Just []) else return Nothing
@@ -454,8 +454,8 @@ convTy (VPi ty c) (VPi ty' c') -- small hack to reduce repeat
 convTy VNat VNat = return (Just [])
 convTy VUniverse VUniverse = return (Just [])
 convTy (VEl t1) (VEl t2) = conv t1 t2
-convTy (VEl t1) ty = conv t1 (VQuote (Thunk ty))
-convTy ty ty'@VEl {} = convTy ty' ty
+-- convTy (VEl t1) ty = conv t1 (VQuote (Thunk ty))
+-- convTy ty ty'@VEl {} = convTy ty' ty
 convTy p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
 
 -- Searches if the substitution and the spine constitutes
@@ -471,6 +471,7 @@ solve (MetaVar _ mid subs) sp v = do
       -- todo this causes a tiny of rechecking
       sol <- closeM vars (Thunk v)
       insertTermSol mid sol
+      return True
     else
       return False
   where
@@ -488,6 +489,7 @@ solveTy (MetaVar _ mid subs) v = do
       -- todo this causes a tiny of rechecking
       sol <- closeTyM vars (Thunk v)
       insertTypeSol mid sol
+      return True
     else
       return False
 

@@ -8,7 +8,7 @@ module NbE (
   vApp, vFst, vSnd, -- vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
   eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  reify, reifyTy, reflectSpine, nf,
+  reify, reifyTy, reifySp, nf,
   MonadMEnv, MetaEnvM, runMetaEnvM
 ) where
 
@@ -17,6 +17,7 @@ import qualified Data.IntSet as IS
 import qualified Data.Map as M
 import qualified Data.Graph as G
 import Control.Monad.State
+import Control.Monad.Except
 import Control.Monad ((<=<))
 import Control.Lens (anyOf)
 import GHC.Generics
@@ -100,7 +101,7 @@ emptyMetaEnv :: MetaEnv
 emptyMetaEnv = MetaEnv IM.empty IM.empty []
   (G.buildG (0,-1) [])
 
-class (Fresh m, MonadState MetaEnv m) => MonadMEnv m
+class (Fresh m, MonadState MetaEnv m, MonadError String m) => MonadMEnv m
 
 -- A closure stores an environment.
 -- TODO hide the constructor and implement pruning
@@ -482,11 +483,10 @@ Closure env cofEnv t $$:+ r = do
 ($$:) :: (MonadMEnv f, Alpha a) => Closure a Type -> (a -> [(Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
----- Reflection
-reflectSpine :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term
-reflectSpine _ [] val = return val
-reflectSpine cofEnv (c:sp) val0 = do
-  val <- reflectSpine cofEnv sp val0
+reifySp :: MonadMEnv m => CofEnv -> [Spine] -> Term -> m Term
+reifySp _ [] val = return val
+reifySp cofEnv (c:sp) val0 = do
+  val <- reifySp cofEnv sp val0
   case c of
     VApp thunk -> App val <$> (reify cofEnv =<< force cofEnv thunk)
     VFst -> return $ Fst val
@@ -506,15 +506,14 @@ reflectSpine cofEnv (c:sp) val0 = do
 
 reify :: MonadMEnv m => CofEnv -> Val -> m Term
 -- We assume these are already forced
-reify cofEnv (VRigid v sp _) = reflectSpine cofEnv sp (Var v)
+reify cofEnv (VRigid v sp _) = reifySp cofEnv sp (Var v)
 reify cofEnv (VFlex (MetaVar name mid subs) sp _)
-  = reflectSpine cofEnv sp . MVar . MetaVar name mid =<<
+  = reifySp cofEnv sp . MVar . MetaVar name mid =<<
     mapM (reify cofEnv <=< force cofEnv) subs
 reify cofEnv (VCon (Const name subs) sp _)
-  = reflectSpine cofEnv sp . Con . Const name =<<
+  = reifySp cofEnv sp . Con . Const name =<<
     mapM (reify cofEnv <=< force cofEnv) subs
 
----- Reification
 reify _ (VLam c) = Lam <$> c $$- \x -> [(x, VVar x)]
 reify cofEnv (VPair th1 th2) = do
   v1 <- force cofEnv th1
@@ -580,12 +579,12 @@ Closure env cofEnv t $$:?- p = do
   reifyTy (bindToken p cofEnv) =<< forceTy (bindToken p cofEnv) (Thunk s')
 
 ---- Example monad to use the functions ----
-type MetaEnvM = StateT MetaEnv FreshM
+type MetaEnvM = StateT MetaEnv (ExceptT String FreshM)
 instance MonadMEnv MetaEnvM
-runMetaEnvM :: MetaEnvM a -> a
-runMetaEnvM m = runFreshM (evalStateT m emptyMetaEnv)
+runMetaEnvM :: MetaEnvM a -> Either String a
+runMetaEnvM m = runFreshM $ runExceptT (evalStateT m emptyMetaEnv)
 
-nf :: Env -> CofEnv -> Term -> Term
+nf :: Env -> CofEnv -> Term -> Either String Term
 nf env cofEnv t = runMetaEnvM $ do
   v <- eval env cofEnv t
   reify cofEnv v
