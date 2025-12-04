@@ -1,7 +1,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wno-unused-do-bind #-}
 module Raw (
-  RVar, Raw (..), RawJudgment (..),
+  Var, Raw (..), Judgment (..),
   parseString
 ) where
 import Unbound.Generics.LocallyNameless
@@ -18,27 +18,27 @@ import System.Exit (exitSuccess)
 import Utils
 
 -- Raw terms
-type RVar = Name Raw
+type Var = Name Raw
 data Raw
-  = RVar RVar | RConst Identifier [Raw]
-  | RLam (Bind RVar Raw) | RApp Raw Raw | RPi Raw (Bind RVar Raw)
-  | RPair Raw Raw | RFst Raw | RSnd Raw | RSigma Raw (Bind RVar Raw)
-  | RZero | RSuc Raw
-  | RNatElim
-    {- motive -} (Bind RVar Raw)
+  = Var Var | Con Identifier [Raw]
+  | Lam (Bind Var Raw) | App Raw Raw | Pi Raw (Bind Var Raw)
+  | Pair Raw Raw | Fst Raw | Snd Raw | Sigma Raw (Bind Var Raw)
+  | Zero | Suc Raw
+  | NatElim
+    {- motive -} (Bind Var Raw)
     {- zero -} Raw
-    {- suc -} (Bind (RVar, RVar) Raw)
+    {- suc -} (Bind (Var, Var) Raw)
     {- arg -} Raw
-  | RNat
-  | RUniverse -- implicit Coquand universe
-  | RThe Raw Raw
-  | RHole
+  | Nat
+  | Universe -- implicit Coquand universe
+  | The Raw Raw
+  | Hole
   deriving (Generic, Show)
 
 instance Alpha Raw
 
 instance Subst Raw Raw where
-  isvar (RVar x) = Just (SubstName x)
+  isvar (Var x) = Just (SubstName x)
   isvar _ = Nothing
 
 ------ Parser ------
@@ -151,43 +151,43 @@ pushVar :: String -> b -> [(String, b)] -> [(String, b)]
 pushVar x vx = if x == "_" then id else ((x,vx):)
 
 toRaw :: [Identifier]
-  -> [(Identifier, RVar)]
+  -> [(Identifier, Var)]
   -> ParseTree
   -> FreshMT (Except String) Raw
-toRaw _ _ THole = return RHole
+toRaw _ _ THole = return Hole
 
-toRaw _ env (TNode v []) | Just v' <- lookup v env = return $ RVar v'
+toRaw _ env (TNode v []) | Just v' <- lookup v env = return $ Var v'
 
 toRaw cenv env (TNode v args) | v `elem` cenv = do
   -- make sure args are not bound, construct a constant
   if not (all (null . fst) args) then
     throwError "Binders not allowed here."
   else
-    RConst v <$> mapM (toRaw cenv env . snd) args
+    Con v <$> mapM (toRaw cenv env . snd) args
 
 toRaw cenv env (TNode "Lam" [([x], b)]) = do
   v <- fresh (s2n x)
-  RLam . bind v <$> toRaw cenv (pushVar x v env) b
-toRaw cenv env (TApp t1 t2) = RApp <$> toRaw cenv env t1 <*> toRaw cenv env t2
+  Lam . bind v <$> toRaw cenv (pushVar x v env) b
+toRaw cenv env (TApp t1 t2) = App <$> toRaw cenv env t1 <*> toRaw cenv env t2
 toRaw cenv env (TNode "Pi" [([], dom), ([x], cod)]) = do
   rdom <- toRaw cenv env dom
   v <- fresh (s2n x)
   rcod <- toRaw cenv (pushVar x v env) cod
-  return $ RPi rdom (bind v rcod)
+  return $ Pi rdom (bind v rcod)
 
-toRaw cenv env (TNode "pair" [([], p), ([], q)]) = RPair <$> toRaw cenv env p <*> toRaw cenv env q
-toRaw cenv env (TNode "fst" [([], p)]) = RFst <$> toRaw cenv env p
-toRaw cenv env (TNode "snd" [([], p)]) = RSnd <$> toRaw cenv env p
+toRaw cenv env (TNode "pair" [([], p), ([], q)]) = Pair <$> toRaw cenv env p <*> toRaw cenv env q
+toRaw cenv env (TNode "fst" [([], p)]) = Fst <$> toRaw cenv env p
+toRaw cenv env (TNode "snd" [([], p)]) = Snd <$> toRaw cenv env p
 toRaw cenv env (TNode "Sigma" [([], dom), ([x], cod)]) = do
   rdom <- toRaw cenv env dom
   v <- fresh (s2n x)
   rcod <- toRaw cenv (pushVar x v env) cod
-  return $ RSigma rdom (bind v rcod)
+  return $ Sigma rdom (bind v rcod)
 
-toRaw _ _ (TNode "zero" []) = return RZero
-toRaw cenv env (TNode "suc" [([], p)]) = RSuc <$> toRaw cenv env p
-toRaw _ _ (TInt k) = return $ nTimes k RSuc RZero
-toRaw _ _ (TNode "Nat" []) = return RNat
+toRaw _ _ (TNode "zero" []) = return Zero
+toRaw cenv env (TNode "suc" [([], p)]) = Suc <$> toRaw cenv env p
+toRaw _ _ (TInt k) = return $ nTimes k Suc Zero
+toRaw _ _ (TNode "Nat" []) = return Nat
 toRaw cenv env (TNode "elim" [([y], m), ([], z), ([x, r], s), ([], n)]) = do
   vy <- fresh (s2n y)
   rm <- toRaw cenv (pushVar y vy env) m
@@ -196,11 +196,11 @@ toRaw cenv env (TNode "elim" [([y], m), ([], z), ([x, r], s), ([], n)]) = do
   vr <- fresh (s2n r)
   rs <- toRaw cenv (pushVar x vx $ pushVar r vr env) s
   rn <- toRaw cenv env n
-  return $ RNatElim (bind vy rm) rz (bind (vx, vr) rs) rn
+  return $ NatElim (bind vy rm) rz (bind (vx, vr) rs) rn
 
-toRaw _ _ (TNode "U" []) = return RUniverse
+toRaw _ _ (TNode "U" []) = return Universe
 
-toRaw cenv env (TNode "the" [([], p), ([], q)]) = RThe <$> toRaw cenv env p <*> toRaw cenv env q
+toRaw cenv env (TNode "the" [([], p), ([], q)]) = The <$> toRaw cenv env p <*> toRaw cenv env q
 
 toRaw _ _ (TNode v _) = throwError $ "Unrecognized identifier: " ++ v
 
@@ -216,12 +216,13 @@ eval E'
 -}
 
 type ParseJudgment = ([(Identifier, ParseTree)], Identifier, ParseTree)
-data RawJudgment
-  = Judge Raw (Maybe Raw)
-  | Hypo Raw (Bind RVar RawJudgment)
+data Judgment
+  = Postulate Raw
+  | Definition Raw Raw
+  | Hypothesis Raw (Bind Var Judgment)
   deriving (Generic, Show)
-instance Alpha RawJudgment
-instance Subst Raw RawJudgment
+instance Alpha Judgment
+instance Subst Raw Judgment
 
 parseJudgment :: Parser ParseJudgment
 parseJudgment = do
@@ -247,7 +248,7 @@ parsePostulate = do
   symbol "postulate"
   parseJudgment
 
-parseTop :: [Identifier] -> Parser (RawJudgment, Identifier)
+parseTop :: [Identifier] -> Parser (Judgment, Identifier)
 parseTop cenv = do
     ((pJ, name, pty), ptm) <- parseDef
     case runExcept $ runFreshMT $ go pJ [] pty (Just ptm) of
@@ -260,22 +261,21 @@ parseTop cenv = do
       Left s -> fail s
   where
     go :: [(Identifier, ParseTree)]
-      -> [(Identifier, RVar)]
+      -> [(Identifier, Var)]
       -> ParseTree -> Maybe ParseTree
-      -> FreshMT (Except String) RawJudgment
+      -> FreshMT (Except String) Judgment
     go [] scope pty mtm = do
       rty <- toRaw cenv scope pty
-      rtm <- case mtm of
-        Nothing -> return Nothing
-        Just ptm -> Just <$> toRaw cenv scope ptm
-      return $ Judge rty rtm
+      case mtm of
+        Nothing -> return $ Postulate rty
+        Just ptm -> Definition rty <$> toRaw cenv scope ptm
     go ((x,xpty):cs) scope pty mtm = do
       xrty <- toRaw cenv scope xpty
       v <- fresh $ s2n x
       res <- go cs (pushVar x v scope) pty mtm
-      return $ Hypo xrty (bind v res)
+      return $ Hypothesis xrty (bind v res)
 
-parseFile :: Parser ([(RawJudgment, Identifier)], Raw)
+parseFile :: Parser ([(Judgment, Identifier)], Raw)
 parseFile = spaceEater *> go [] <* eof
   where
     go cenv = do
@@ -289,7 +289,7 @@ parseFile = spaceEater *> go [] <* eof
         (js, rtm) <- go (x:cenv)
         return ((j,x):js, rtm)
 
-parseString :: String -> IO ([(RawJudgment, Identifier)], Raw)
+parseString :: String -> IO ([(Judgment, Identifier)], Raw)
 parseString src =
   case parse parseFile "(stdin)" src of
     Left e -> do
