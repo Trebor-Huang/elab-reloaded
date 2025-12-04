@@ -462,9 +462,10 @@ solve (MetaVar _ mid subs) sp v = do
     spine (VApp s) = Just <$> forceM s
     spine _ = return Nothing
 
-solveTy :: Tyck m => MetaVar Val -> TyVal -> m Bool
+solveTy :: Tyck m => MetaVar (Thunk Val) -> TyVal -> m Bool
 solveTy (MetaVar _ mid subs) v = do
-  let rvars' = mapM toVar subs
+  vsubs <- mapM forceM subs
+  let rvars' = mapM toVar vsubs
   case rvars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do

@@ -142,7 +142,7 @@ data Val
   deriving Show
 
 data TyVal
-  = VMTyVar (MetaVar Val) !(Cases (Thunk TyVal))
+  = VMTyVar (MetaVar (Thunk Val)) !(Cases (Thunk TyVal))
   | VEl Val
     -- this should be VTyNeutral,
     -- but the thunk inside can only be neutral terms to be type correct
@@ -179,12 +179,12 @@ vMeta sp st m@(MetaVar _ mid subs) = do
       return $ VFlex m sp $ unfoldCase <> st
     Nothing -> return $ VFlex m sp EmptyCases
 
-vMetaTy :: MonadMEnv m => Cases (Thunk TyVal) -> MetaVar Val -> m TyVal
+vMetaTy :: MonadMEnv m => Cases (Thunk TyVal) -> MetaVar (Thunk Val) -> m TyVal
 vMetaTy st m@(MetaVar _ mid subs) = do
   sol <- gets (IM.lookup mid . typeSol)
   case sol of
     Just b -> do
-      vsol <- b $$: (`zip'` subs)
+      vsol <- b $$: (`zip'` map unthunk subs)
       let unfoldCase = SingleCase mempty (Thunk vsol)
       return $ VMTyVar m $ unfoldCase <> st
     Nothing -> return $ VMTyVar m st
@@ -309,18 +309,16 @@ vNatElim m z s = \case
 
 thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 
--- Todo refactor everything before this into its own file, and hide "unthunk"
-
 -- If the neutral form destablizes, fetch the resulting value
 -- If the metavariable produced a solution, fetch the solution too
 force :: MonadMEnv m => CofEnv -> Thunk Val -> m Val
-force cofEnv (Thunk (VFlex mv sp st)) = do -- todo this is so messy and not completely forced
-  u <- vMeta sp st mv -- todo this may also repeat solutions
-  case u of
-    VFlex _ _ st -> case cofSelect cofEnv st of
+force cofEnv (Thunk m@(VFlex (MetaVar _ mid subs) sp st)) = do
+  sol <- gets (IM.lookup mid . termSol)
+  case sol of
+    Just b -> vSpine sp =<< b $$ (`zip'` map unthunk subs)
+    Nothing -> case cofSelect cofEnv st of
       Just x -> force cofEnv x
-      Nothing -> return u
-    _ -> error "Impossible"
+      Nothing -> return m
 force cofEnv (Thunk (VRigid _ _ st))
   | Just x <- cofSelect cofEnv st = force cofEnv x
 force cofEnv (Thunk (VCon _ _ st))
@@ -328,13 +326,13 @@ force cofEnv (Thunk (VCon _ _ st))
 force _ (Thunk a) = return a
 
 forceTy :: MonadMEnv m => CofEnv -> Thunk TyVal -> m TyVal
-forceTy cofEnv (Thunk (VMTyVar m st)) = do
-  u <- vMetaTy st m
-  case u of
-    VMTyVar _ st -> case cofSelect cofEnv st of
+forceTy cofEnv (Thunk m@(VMTyVar (MetaVar _ mid subs) st)) = do
+  sol <- gets (IM.lookup mid . typeSol)
+  case sol of
+    Just b -> b $$: (`zip'` map unthunk subs)
+    Nothing -> case cofSelect cofEnv st of
       Just x -> forceTy cofEnv x
-      Nothing -> return u
-    _ -> error "Impossible"
+      Nothing -> return m
 forceTy cofEnv (Thunk (VEl t)) = VEl <$> force cofEnv (Thunk t)
 forceTy _ (Thunk a) = return a
 
@@ -394,7 +392,8 @@ eval env cofEnv = \case
 evalTy :: MonadMEnv m => Env -> CofEnv -> Type -> m TyVal
 evalTy env cofEnv = \case
   MTyVar (MetaVar name mid subs)
-    -> vMetaTy EmptyCases . MetaVar name mid =<< mapM (eval env cofEnv) subs
+    -> vMetaTy EmptyCases . MetaVar name mid . map Thunk =<<
+      mapM (eval env cofEnv) subs
   Sigma t1 t2 -> do
     v1 <- evalTy env cofEnv t1
     return $ VSigma (Thunk v1) (closeB env cofEnv t2)
@@ -485,7 +484,8 @@ reify cofEnv (VQuote thty) = Quote <$> (reifyTy cofEnv =<< forceTy cofEnv thty)
 reifyTy :: MonadMEnv m => CofEnv -> TyVal -> m Type
 -- reflection
 reifyTy cofEnv (VMTyVar (MetaVar name mid subs) _)
-  = MTyVar . MetaVar name mid <$> mapM (reify cofEnv) subs
+  = MTyVar . MetaVar name mid <$>
+    mapM (reify cofEnv <=< force cofEnv) subs
 
 -- reification
 reifyTy cofEnv (VSigma thty c) = do
