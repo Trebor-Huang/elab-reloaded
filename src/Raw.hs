@@ -16,11 +16,14 @@ import Control.Monad.Except
 import System.Exit (exitSuccess)
 
 import Utils
+import Cofibration
 
 -- Raw terms
 type Var = Name Raw
 data Raw
-  = Var Var | Con Identifier [Raw]
+  = Var Var
+  | Con Identifier [Raw]  -- user-input constants
+  | Con' Identifier [Raw] -- true constants
   | Lam (Bind Var Raw) | App Raw Raw | Pi Raw (Bind Var Raw)
   | Pair Raw Raw | Fst Raw | Snd Raw | Sigma Raw (Bind Var Raw)
   | Zero | Suc Raw
@@ -30,6 +33,7 @@ data Raw
     {- suc -} (Bind (Var, Var) Raw)
     {- arg -} Raw
   | Nat
+  | InCof Cof Raw | OutCof Cof Raw Raw  -- internal use
   | Universe -- implicit Coquand universe
   | The Raw Raw
   | Hole

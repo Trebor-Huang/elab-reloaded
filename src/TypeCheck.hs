@@ -1,9 +1,9 @@
-{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 module TypeCheck (
-  -- TyckM, runTyckM, evalTyckM, emptyContext,
-  -- check, checkTy, infer, conv, convTy,
-  -- zonk, zonkTy, processFile
+  TyckM, execTyckM, evalTyckM, emptyContext,
+  check, checkTy, infer, conv, convTy,
+  zonk, zonkTy, processFile
 ) where
+import Control.Monad (unless)
 import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -22,17 +22,6 @@ import NbE (Val, TyVal, Spine)
 import NbE hiding (Val(..), TyVal(..), Spine(..))
 import Utils
 import Cofibration
-
-
-{-
-declareConst :: String -> Maybe Cof -> Entry
-  -> Context -> Context
-declareConst name unfolds val ctx =
-  ctx {
-    -- either directly binds this, or declare a new constant less than this
-    env = bindGlobal name unfolds val (env ctx)
-  }
--}
 
 -- Prepare some primitive operations
 newVar :: Tyck m => R.Var -> Var -> Thunk TyVal -> m a -> m a
@@ -115,12 +104,17 @@ check (R.Pair s1 s2) (V.Sigma th1 t2) = do
 check R.Zero V.Nat = return Zero
 check (R.Suc t) V.Nat = Suc <$> check t V.Nat
 
-check tm ty = do
-  (tm', thty') <- infer tm
-  unify' [Right (Thunk ty, thty')]
-  return tm'
+check (R.InCof p _) (V.Ext _ q _)
+  | p /= q = throwError "Cofibration mismatch"
+  | otherwise = error "todo"
 
-checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
+check tm ty = trace ("Trying to infer the type of "++show tm) do
+  (tm', thty') <- infer tm
+  trace ("Infer success: " ++ show tm') do
+    unify' [Right (Thunk ty, thty')]
+    return tm'
+
+checkTy :: Tyck m => Raw -> m Type
 checkTy (R.Pi rdom rc) = do
   dom <- checkTy rdom
   vdom <- evalTy dom
@@ -140,22 +134,39 @@ checkTy R.Universe = return Universe
 checkTy R.Hole = MTyVar <$> freshAnonMeta
 checkTy rtm = El <$> check rtm V.Universe
 
-checkJudgment :: Tyck m => [String] -> R.Judgment -> m Entry
-checkJudgment unfolding (R.Postulate rty) = do
+data JudgmentResult a
+  = JPostulate a
+  | JDefinition Bool Cof a a
+  deriving Functor
+internalName :: String -> String
+internalName n = "_internal_" ++ n
+
+checkJudgment :: Tyck m =>
+  Cof -> String -> R.Judgment -> m (JudgmentResult Entry)
+checkJudgment _ _ (R.Postulate rty) = do
   ty <- checkTy rty
-  return $ Postulate ty
-checkJudgment unfolding (R.Definition _ rty rtm) = do -- todo
+  return $ JPostulate $ Postulate ty
+checkJudgment p name (R.Definition u rty rtm) = do
   ty <- checkTy rty
   vty <- evalTy ty
-  tm <- check rtm vty
-  return $ Definition ty tm
-checkJudgment unfolding (R.Hypothesis rty bj) = do
+  tm <- bindCof p $ check rtm vty
+  cof <- case unignore u of
+    Opaque -> freshCof name p
+    Controlled -> freshCof name p
+    Transparent -> return p
+  vs <- asks rvars
+  return $ JDefinition (unignore u == Opaque) cof
+    (Definition ty tm) -- the definition
+    (Postulate (Ext ty cof (Con
+      (Const (internalName name) (map (Var . coerce . fst) vs)))))
+
+checkJudgment p name (R.Hypothesis rty bj) = do
   ty <- checkTy rty
   vty <- evalTy ty
   (x, j) <- unbind bj
   let x' = coerce x :: Var
-  entry <- newVar x x' (Thunk vty) $ checkJudgment unfolding j
-  return $ Hypothesis ty $ bind x' entry
+  entry <- newVar x x' (Thunk vty) $ checkJudgment p name j
+  return $ Hypothesis ty . bind x' <$> entry
 
 infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
 infer R.Hole = do
@@ -164,12 +175,13 @@ infer R.Hole = do
   vty <- evalTy (MTyVar mty)
   return (MVar m, Thunk vty)
 
-infer (R.Con name args) = do
-  -- todo insert outCof constructor here
-  ge <- gets decls
-  case M.lookup name ge of
+infer (R.Con' name args) = do
+  n <- gets (M.lookup name . decls)
+  case n of
     Nothing -> error "Impossible: constant not found"
-    Just (_, entry) -> do
+    Just (unfold, entry) -> do
+      good <- isTrue unfold
+      unless good $ throwError "Impossible: Cofibration mismatch"
       (targs, ty) <- go entry args
       return (Con (Const name targs), ty)
   where
@@ -190,6 +202,17 @@ infer (R.Con name args) = do
       vty <- evalTy ty
       return ([], Thunk vty)
     go _ _ = throwError "Wrong number of arguments"
+
+infer (R.Con name args) = do
+  c <- gets (M.lookup name . symbs)
+  case c of
+    -- this is a true postulate
+    Nothing -> infer (R.Con' name args)
+    -- this is a definition
+    Just (_, cof) -> trace ("Inferring user constant " ++ name) $ infer
+      (R.OutCof cof
+        (R.Con' (internalName name) args)
+        (R.Con' name args))
 
 infer (R.The rty rtm) = do
   ty <- checkTy rty
@@ -289,7 +312,16 @@ infer (R.NatElim rmc rz rsc rarg) = do
 infer R.Nat = return (Quote Nat, Thunk V.Universe)
   -- since it's just one step we can inline it
 
--- todo other infer
+infer (R.InCof _ _) = error "todo"
+
+infer t@(R.OutCof p rres rterm) = trace ("Inferring " ++ show t) do
+  (tres, vtyres) <- bindCof p $ infer rres
+  cres <- closeB (bind () tres)
+  mty <- freshAnonMeta
+  vty <- Thunk <$> evalTy (MTyVar mty)
+  term <- check rterm (V.Ext vty p cres)
+  bindCof p $ unify' [Right (vtyres, vty)]
+  return (OutCof p tres term, vty)
 
 infer R.Universe = return (Quote Universe, Thunk V.Universe)
   -- todo add universe constraint (i.e. don't inline this)
@@ -327,7 +359,7 @@ convSp (sp0:sp) (sp0':sp') = (++) <$> convSp sp sp' <*> case (sp0, sp0') of
     vs' <- s' $$ \(m', k') -> [(m', V.Var m), (k', V.Var k)]
 
     withCtx [Left (Thunk vz, Thunk vz'), Left (Thunk vs, Thunk vs')]
-  -- todo other spine
+  (V.OutCof _ _, V.OutCof _ _) -> return [] -- similar thing here
   p -> throwError $ "Not convertible: " ++ show p
 convSp p q = throwError $ "Not convertible: " ++ show p ++ show q
 
@@ -385,7 +417,13 @@ conv (V.Suc n th) (V.Suc m th') =
   else
     throwError $ show n ++ " /= " ++ show m
 
--- todo Lock, InCof
+conv (V.InCof p1 th1) (V.InCof p2 th2) =
+  if p1 == p2 then bindCof p1 do
+    t1 <- force th1
+    t2 <- force th2
+    conv t1 t2
+  else
+    throwError $ show p1 ++ " /= " ++ show p2
 
 conv (V.Quote th1) (V.Quote th2) = do
   ty1 <- forceTy th1
@@ -415,10 +453,13 @@ convTy (V.Ext ty p tm) (V.Ext ty' p' tm') =
   if p /= p' then
     throwError $ "Not convertible: " ++ show p ++ " /= " ++ show p'
   else do
+    e <- asks env
     q <- asks cofEnv
     v <- tm $$? p
     v' <- tm' $$? p'
-    return $ Just [(q, Right (ty, ty')), (p <> q, Left (Thunk v, Thunk v'))]
+    return $ Just
+      [(e, q, Right (ty, ty')),
+      (e, p <> q, Left (Thunk v, Thunk v'))]
 convTy V.Universe V.Universe = return (Just [])
 convTy (V.El t1) (V.El t2) = conv t1 t2
 -- This is needed because V.El is special
@@ -430,6 +471,7 @@ convTy p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
 -- a linear set of variables, and if so adds the solution
 solve :: Tyck m => MetaVar (Thunk Val) -> [Spine] -> Val -> m Bool
 solve (MetaVar _ mid subs) sp v = do
+  -- todo check that the cofibration environment is correct
   vsp <- mapM spine sp
   vsubs <- mapM force subs
   let vars' = sequence (map toVar vsubs ++ map (toVar =<<) vsp)
@@ -466,20 +508,20 @@ solveTy (MetaVar _ mid subs) v = do
 -- splits into zero or more smaller equations, without recursively solving
 -- (unless it's straightforward to do so)
 attempt :: Tyck m => Equation -> m (Maybe [Equation])
-attempt (c, Left (th1, th2)) = withContext emptyEnv c do
+attempt (e, c, Left (th1, th2)) = withContext e c do
   t1 <- force th1
   t2 <- force th2
   conv t1 t2
-attempt (c, Right (th1, th2)) = withContext emptyEnv c do
+attempt (e, c, Right (th1, th2)) = withContext e c do
   t1 <- forceTy th1
   t2 <- forceTy th2
   convTy t1 t2
 
 -- Adds the equations under current context
-withCtx :: Tyck m => [a] -> m [(Cof, a)]
+withCtx :: Tyck m => [a] -> m [(Env, Cof, a)]
 withCtx eqs = do
   ctx <- ask
-  return $ map (\eq -> (cofEnv ctx, eq)) eqs
+  return $ map (\eq -> (env ctx, cofEnv ctx, eq)) eqs
 
 unify' :: Tyck m =>
   [Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)] -> m ()
@@ -545,8 +587,6 @@ zonk (NatElim m z s c) = do
   zs <- bindVar [(n, V.Var n), (r, V.Var r)] $ zonk s'
   zc <- zonk c
   return $ NatElim (bind x zm) zz (bind (n, r) zs) zc
-zonk (Lock p tm) = Lock p <$> zonk tm
-zonk (Unlock tm p) = (`Unlock` p) <$> zonk tm
 zonk (InCof p tm) = InCof p <$> zonk tm
 zonk (OutCof p t1 t2) = OutCof p <$> zonk t1 <*> zonk t2
 zonk (Quote ty) = Quote <$> zonkTy ty
@@ -569,15 +609,23 @@ zonkTy (Pi ty f) = do
   zf <- bindVar [(x, V.Var x)] $ zonkTy f'
   return $ Pi zty $ bind x zf
 zonkTy Nat = return Nat
-zonkTy (Pushforward p ty) = Pushforward p <$> zonkTy ty
 zonkTy (Ext ty p tm) = (`Ext` p) <$> zonkTy ty <*> zonk tm
 zonkTy Universe = return Universe
 zonkTy (El tm) = El <$> zonk tm
 
 ---- Processing whole files ----
-processFile :: Tyck m =>
-  [(R.Judgment, [String], String)] -> Raw -> m (Type, Term, Term)
-processFile [] expr = do
+calculateUnfolds :: Tyck m => [String] -> m Cof
+calculateUnfolds ns = do
+  e <- gets symbs
+  return $ mconcat (map (go e) ns)
+  where
+    go e v = case M.lookup v e of
+      Just (False, c) -> c
+      Just (True, _) -> error $ "calculateUnfolds: cannot unfold opaque " ++ v
+      Nothing -> error $ "calculateUnfolds: unknown constant " ++ v
+
+processFile :: Tyck m => [R.TopLevel] -> Raw -> m (Type, Term, Term)
+processFile [] expr = trace ("Evaluating: " ++ show expr) do
   (tm, vty) <- infer expr
   vtm <- eval tm
   ztm <- zonk tm
@@ -585,13 +633,23 @@ processFile [] expr = do
   ty <- reifyTy =<< forceTy vty
   ntm <- reify =<< force (Thunk vtm)
   return (ty, ztm, ntm)
-processFile ((rj,unfolding,name):decl) expr = do
+processFile (R.TopLevel rj unfolding name:decl) expr =
+  trace ("Defining " ++ name) do
   -- calculate the unfoldings and work locally
-  _
-  j <- checkJudgment unfolding rj
-  -- declare two constants, one directly from j, the other
-  -- wrapped in an extension type
-  _
+  cof <- calculateUnfolds unfolding
+  result <- checkJudgment cof name rj
+  case result of
+    JPostulate j -> modify \st -> st {
+      -- todo the cof assumption here doesn't look necessary
+      decls = M.insert name (cof, j) (decls st)
+    }
+    JDefinition opaque newcof def con -> modify \st -> st {
+      decls =
+        M.insert name (mempty, con) $
+        M.insert (internalName name) (cof, def) $
+        decls st,
+      symbs = M.insert name (opaque, newcof) (symbs st)
+    }
   processFile decl expr
   -- todo freeze metas
 

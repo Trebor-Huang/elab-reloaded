@@ -11,7 +11,7 @@ main = do
   putStrLn "Read file."
   (decl, expr) <- parseString src
   putStrLn "Parsed file."
-  case runTyckM $ processFile decl expr of
+  case execTyckM $ processFile decl expr of
     Left err -> putStrLn err
     Right ((ty, tm, ntm), memv) -> do
       putStr "Meta Env: "

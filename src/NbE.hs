@@ -1,7 +1,8 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 module NbE (
-  Env, Context(..), emptyEnv, emptyContext, withContext, bindVar, bindCof,
+  Env, Context(..), emptyEnv, emptyContext, withContext, bindVar,
+  bindCof, freshCof, isTrue,
   Equation, MetaEnv(..), emptyMetaEnv,
   Entry(..), Decls(..), emptyDecls,
   Closure, closeB, getClosureMetas, Spine(..),
@@ -20,7 +21,7 @@ import qualified Data.Graph as G
 import Control.Monad.State
 import Control.Monad.Reader
 import Control.Monad.Except
-import Control.Monad ((<=<))
+import Control.Monad ((<=<), unless)
 import Control.Lens (anyOf)
 import GHC.Generics
 import Unbound.Generics.LocallyNameless
@@ -46,7 +47,7 @@ emptyContext :: Context
 emptyContext = Context emptyEnv mempty []
 
 -- Metavariable environment
-type Equation = (Cof, Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal))
+type Equation = (Env, Cof, Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal))
 
 data MetaEnv = MetaEnv {
   termSol :: IM.IntMap (Closure [S.Var] S.Term),
@@ -65,18 +66,20 @@ data Entry
   = Definition S.Type S.Term
   | Postulate S.Type
   | Hypothesis S.Type (Bind S.Var Entry)
-  | Locked Cof Entry
   deriving (Generic, Show)
 instance Alpha Entry
 
 data Decls = Decls {
-  decls :: M.Map String (Maybe Cof, Entry),
+  decls :: M.Map String
+    ({- cof assumption -} Cof, Entry),
+  symbs :: M.Map String
+    ({- is opaque? -} Bool, {- unfolds when -} Cof),
   world :: World,
   metas :: MetaEnv
 } deriving Show
 
 emptyDecls :: Decls
-emptyDecls = Decls M.empty emptyWorld emptyMetaEnv
+emptyDecls = Decls M.empty M.empty emptyWorld emptyMetaEnv
 
 class (MonadReader Context m, Fresh m, MonadState Decls m, MonadError String m)
   => Tyck m
@@ -86,14 +89,14 @@ lookupVar v = do
   res <- asks $ M.lookup v . env
   case res of
     Just val -> return val
-    Nothing -> error "lookupLocal: impossible"
+    Nothing -> error $ "lookupLocal: unknown variable " ++ show v
       -- because we already scope checked
 
-lookupCon :: Tyck m => String -> m Entry
+lookupCon :: Tyck m => String -> m (Cof, Entry)
 lookupCon c = do
   res <- gets $ M.lookup c . decls
   case res of
-    Just (_, val) -> return val
+    Just val -> return val
     Nothing -> error $ "lookupGlobal: unknown constant " ++ c
 
 bindVar :: Tyck m => [(S.Var, Val)] -> m a -> m a
@@ -109,20 +112,18 @@ bindCof p = local \ctx -> ctx {
 selectCases :: Tyck m => Cases a -> m (Maybe a)
 selectCases st = gets (select . world) <*> asks cofEnv <*> return st
 
-{-
-calculateUnfolds :: Env -> [String] -> Cof
-calculateUnfolds e ns = mconcat (map go ns)
-  where
-    go v = case M.lookup v (globalEnv e) of
-      Just (Just c, _) -> c
-      Just (Nothing, _) -> error $ "lookupGlobal: cannot unfold " ++ v
-      Nothing -> error $ "lookupGlobal: unknown constant " ++ v
+isTrue :: Tyck m => Cof -> m Bool
+isTrue p = do
+  decls <- get
+  ctx <- ask
+  return $ implies (world decls) (cofEnv ctx) p
 
-bindGlobal :: String -> Maybe Cof -> Entry -> Env -> Env
-bindGlobal n p v e = e {
-  globalEnv = M.insert n (p, v) $ globalEnv e
-}
--}
+freshCof :: Tyck m => String -> Cof -> m Cof
+freshCof name p = do
+  st <- get
+  let (a, w') = newAtom name p (world st)
+  put st { world = w' }
+  return (fromAtom a)
 
 -- A closure stores an environment.
 data Closure r t = Closure Env Cof (Bind r t)
@@ -158,7 +159,6 @@ data Spine
     (Closure () S.Term)
     (Closure (S.Var, S.Var) S.Term)
     {- -}
-  | Unlock {- -} Cof
   | OutCof Cof (Thunk Val) {- -}
   deriving Show
 -- There should be a TySpine in principle but it's just El by itself...
@@ -171,7 +171,6 @@ getSpineMetas (NatElim c1 c2 c3) =
   getClosureMetas S.getTyMetas c1 `IS.union`
   getClosureMetas S.getMetas c2 `IS.union`
   getClosureMetas S.getMetas c3
-getSpineMetas (Unlock _) = IS.empty
 getSpineMetas (OutCof _ (Thunk v)) = getMetas v
 
 data Val
@@ -184,7 +183,6 @@ data Val
   | Lam (Closure S.Var S.Term)
   | Pair (Thunk Val) (Thunk Val)
   | Zero | Suc Int (Thunk Val)
-  | Lock Cof (Closure () S.Term)
   | InCof Cof (Thunk Val)
   | Quote (Thunk TyVal)
   deriving Show
@@ -202,7 +200,6 @@ getMetas (Pair (Thunk a) (Thunk b)) =
   getMetas a `IS.union` getMetas b
 getMetas Zero = IS.empty
 getMetas (Suc _ (Thunk v)) = getMetas v
-getMetas (Lock _ c) = getClosureMetas S.getMetas c
 getMetas (InCof _ (Thunk v)) = getMetas v
 getMetas (Quote (Thunk v)) = getTyMetas v
 
@@ -217,7 +214,6 @@ data TyVal
   | Sigma (Thunk TyVal) (Closure S.Var S.Type)
   | Pi (Thunk TyVal) (Closure S.Var S.Type)
   | Nat
-  | Pushforward Cof (Closure () S.Type)
   | Ext (Thunk TyVal) Cof (Closure () S.Term)
   | Universe
   deriving Show
@@ -230,7 +226,6 @@ getTyMetas (Sigma (Thunk v) c) =
 getTyMetas (Pi (Thunk v) c) =
   getTyMetas v `IS.union` getClosureMetas S.getTyMetas c
 getTyMetas Nat = IS.empty
-getTyMetas (Pushforward _ c) = getClosureMetas S.getTyMetas c
 getTyMetas (Ext (Thunk v) _ c) =
   getTyMetas v `IS.union` getClosureMetas S.getMetas c
 getTyMetas Universe = IS.empty
@@ -270,7 +265,10 @@ vMetaTy st m@(S.MetaVar _ mid subs) = do
 -- evaluates a constant under a substitution
 vCon :: Tyck m => [Spine] -> S.Const (Thunk Val) -> m Val
 vCon sp c@(S.Const name subs) = do
-  entry <- lookupCon name
+  (cof, entry) <- lookupCon name
+  good <- isTrue cof
+  unless good $
+    throwError $ "vCon: Cofibration " ++ show cof ++ " does not hold"
   result <- vCon' entry (map unthunk subs)
   Con c sp <$> mapM (\x -> Thunk <$> vSpine sp (unthunk x)) result
 
@@ -278,7 +276,6 @@ vCon' :: Tyck m => Entry -> [Val] -> m (Cases (Thunk Val))
 vCon' (Hypothesis _ bg) (v:subs) = do
   (x, g) <- unbind bg
   bindVar [(x, v)] $ vCon' g subs
-vCon' (Locked p g) subs = bindCof p $ vCon' g subs
 vCon' (Definition _ tm) [] = SingleCase mempty . Thunk <$> eval tm
 vCon' (Postulate _) [] = return EmptyCases
 vCon' _ _ = error "Impossible"
@@ -292,7 +289,6 @@ vSpine (c:sp) v0 = do
     Fst -> return $ vFst v
     Snd -> return $ vSnd v
     NatElim m z s -> vNatElim m z s v
-    Unlock p -> vUnlock v p
     OutCof p u -> return $ vOutCof p u v
 
 vApp :: Tyck m => Val -> Val -> m Val
@@ -307,19 +303,6 @@ vApp fun arg = case fun of
   u -> error $ "vApp: Impossible " ++ show u
 
 thApp arg fun = Thunk <$> vApp (unthunk fun) arg
-
-vUnlock :: Tyck m => Val -> Cof -> m Val
-vUnlock t p = case t of
-  Lock q t' -> t' $$? q
-  Flex mv sp st ->
-    Flex mv (Unlock p : sp) <$> mapM (thUnlock p) st
-  Rigid v sp st ->
-    Rigid v (Unlock p : sp) <$> mapM (thUnlock p) st
-  Con c sp st ->
-    Con c (Unlock p : sp) <$> mapM (thUnlock p) st
-  _ -> error "Impossible"
-
-thUnlock p x = Thunk <$> vUnlock (unthunk x) p
 
 vOutCof :: Cof -> Thunk Val -> Val -> Val
 vOutCof _ _ (InCof _ t) = unthunk t
@@ -377,7 +360,7 @@ vNatElim m z s = \case
     Rigid v (NatElim m z s : sp) <$> mapM (thNatElim m z s) st
   Con c sp st ->
     Con c (NatElim m z s : sp) <$> mapM (thNatElim m z s) st
-  _ -> error "Impossible"
+  u -> error $ "vNatElim: Impossible " ++ show u
 
 thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 
@@ -452,11 +435,6 @@ eval = \case
     v <- eval t
     vNatElim cm cz cs v
 
-  S.Lock p t -> Lock p <$> closeB (bind () t)
-  S.Unlock t p -> do
-    v <- eval t
-    vUnlock v p
-
   S.InCof p t -> do
     v <- eval t
     return $ InCof p (Thunk v)
@@ -479,7 +457,6 @@ evalTy = \case
     v1 <- evalTy t1
     Pi (Thunk v1) <$> closeB t2
   S.Nat -> return Nat
-  S.Pushforward p ty -> Pushforward p <$> closeB (bind () ty)
   S.Ext ty p tm -> do
     vty <- evalTy ty
     Ext (Thunk vty) p <$> closeB (bind () tm)
@@ -532,7 +509,6 @@ reifySp (c:sp) val0 = do
       ts <- cs $$- \(k,r) -> [(k, Var k), (r, Var r)]
       -- instead of tym, directly use cm
       return $ S.NatElim tym tz' ts val
-    Unlock p -> return $ S.Unlock val p
     OutCof p u -> do
       vu <- force u
       tu <- reify vu
@@ -557,8 +533,6 @@ reify (Pair th1 th2) = do
 reify Zero = return S.Zero
 reify (Suc k th) = nTimes k S.Suc <$> (reify =<< force th)
 
-reify (Lock p c) = S.Lock p <$> c $$?- p
-
 reify (InCof p th) = S.InCof p <$> (reify =<< force th)
 
 reify (Quote thty) = S.Quote <$> (reifyTy =<< forceTy thty)
@@ -577,7 +551,6 @@ reifyTy (Pi thty c) = do
   t <- c $$:- \x -> [(x, Var x)]
   return $ S.Pi ty t
 reifyTy Nat = return S.Nat
-reifyTy (Pushforward p c) = S.Pushforward p <$> c $$:?- p
 reifyTy (Ext thty p c) = do
   ty <- reifyTy =<< forceTy thty
   S.Ext ty p <$> c $$?- p
@@ -603,9 +576,3 @@ Closure env cofEnv t $$?- p = withContext env cofEnv $ bindCof p do
   (_, s) <- unbind t
   s' <- eval s
   reify =<< force (Thunk s')
-
-($$:?-) :: Tyck m => Closure () S.Type -> Cof -> m S.Type
-Closure env cofEnv t $$:?- p = withContext env cofEnv $ bindCof p do
-  (_, s) <- unbind t
-  s' <- evalTy s
-  reifyTy  =<< forceTy (Thunk s')

@@ -16,6 +16,12 @@ define
   A : U; B : U |- flip : (A * B) -> (B * A)
   = \p. pair(snd(p), fst(p))
 
+{-
+define unfolding {flip}
+  A : U; B : U; p : A * B |- flipflip : Id(_, flip(_,_) (flip(_,_) p), p)
+  = refl(_, _)
+-}
+
 define
   A : U; B : U; C : U |- compose : (A -> B) -> (B -> C) -> (A -> C)
   = λf. λg. λa. g (f a)
@@ -28,6 +34,6 @@ define
     n
   )
 
-eval
+eval ack 3 4
   -- repeat(Nat * Nat, 1) flip(_, _)
-  repeat(Nat * Nat, ack 3 4) flip(_, _)
+  -- repeat(Nat * Nat, ack 3 4) flip(_, _)

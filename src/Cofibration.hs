@@ -1,6 +1,6 @@
 module Cofibration (
   Atom,
-  World, emptyWorld,
+  World, emptyWorld, newAtom,
   Cof, implies, fromAtom,
   Cases, pattern EmptyCases, pattern SingleCase, select) where
 import qualified Data.IntMap as IM
@@ -28,6 +28,17 @@ data World = World {
 
 emptyWorld :: World
 emptyWorld = World IM.empty IM.empty 0
+
+newAtom :: String -> Cof -> World -> (Atom, World)
+newAtom name p w =
+  let
+    i = nextAtom w
+    a = Atom name i in
+    (a, w {
+      atoms = IM.insert i name (atoms w),
+      relations = IM.insert i p (relations w),
+      nextAtom = i + 1
+    })
 
 newtype Cof = Cof (Ignore (IM.IntMap String)) -- a list for conjunctions
   deriving (Generic, Show)
