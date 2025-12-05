@@ -1,15 +1,16 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
+{-# OPTIONS_GHC -Wno-name-shadowing #-}
 module NbE (
-  GlobalEntry(..), Env(..), emptyEnv, CofEnv(..), emptyCofEnv,
-  bindLocal, bindGlobal,
+  Env, Context(..), emptyEnv, emptyContext, withContext, bindVar, bindCof,
   Equation, MetaEnv(..), emptyMetaEnv,
+  Entry(..), Decls(..), emptyDecls,
   Closure, closeB, getClosureMetas, Spine(..),
   Val(.. {- exclude neutral constructors -}, Var), toVar,
   vApp, vFst, vSnd, vEl, -- vSuc, vNatElim, vSpine, vCon,
   TyVal(..), Thunk (Thunk), force, forceTy,
-  eval, evalTy, ($$), ($$:), ($$+), ($$:+),
-  reify, reifyTy, reifySp, nf,
-  MonadMEnv, MetaEnvM, runMetaEnvM
+  eval, evalTy, ($$), ($$?), ($$:), ($$+), ($$:+),
+  reify, reifyTy,
+  Tyck
 ) where
 
 import qualified Data.IntMap as IM
@@ -17,6 +18,7 @@ import qualified Data.IntSet as IS
 import qualified Data.Map as M
 import qualified Data.Graph as G
 import Control.Monad.State
+import Control.Monad.Reader
 import Control.Monad.Except
 import Control.Monad ((<=<))
 import Control.Lens (anyOf)
@@ -25,111 +27,137 @@ import Unbound.Generics.LocallyNameless
 import Unbound.Generics.LocallyNameless.Unsafe (unsafeUnbind)
 
 import qualified Syntax as S
+import qualified Raw as R
 import Cofibration
 import Utils
 
--- todo check if all the monad assumptions are required
---- Environment
--- TODO include cof assumptions, and definitions can destabilize
-data GlobalEntry
-  = Definition S.Type S.Term
-  | Postulate S.Type
-  | Hypothesis S.Type (Bind S.Var GlobalEntry)
-  -- Global definitions can't be closures
-  | Locked Cof GlobalEntry
-  deriving (Generic, Show)
-instance Alpha GlobalEntry
-
-data Env = Env {
-  localEnv :: M.Map S.Var Val,
-  globalEnv :: M.Map String GlobalEntry
+-- Environment
+type Env = M.Map S.Var Val  -- a substitution
+data Context = Context {
+  env :: Env,  -- do we need to record the types of the codomain?
+  cofEnv :: Cof,
+  rvars :: [(R.Var, Thunk TyVal)]
 } deriving Show
 
 emptyEnv :: Env
-emptyEnv = Env M.empty M.empty
+emptyEnv = M.empty
 
-lookupLocal :: Env -> S.Var -> Val
-lookupLocal e v = case M.lookup v (localEnv e) of
-  Just val -> val
-  Nothing -> error "lookupLocal: impossible"
+emptyContext :: Context
+emptyContext = Context emptyEnv mempty []
 
-bindLocal :: [(S.Var, Val)] -> Env -> Env
-bindLocal bds e = e {
-  localEnv = M.union (M.fromList bds) $ localEnv e
-}
-
-lookupGlobal :: Env -> String -> GlobalEntry
-lookupGlobal e v = case M.lookup v (globalEnv e) of
-  Just val -> val
-  Nothing -> error $ "lookupGlobal: unknown constant " ++ v
-
-bindGlobal :: String -> GlobalEntry -> Env -> Env
-bindGlobal n v e = e {
-  globalEnv = M.insert n v $ globalEnv e
-}
-
-data CofEnv = CofEnv {
-  localTokens :: Cof,
-  globalTokens :: World
-} deriving Show
-
-emptyCofEnv :: CofEnv
-emptyCofEnv = CofEnv mempty emptyWorld
-
-bindToken :: Cof -> CofEnv -> CofEnv
-bindToken p cofEnv = cofEnv {
-  localTokens = localTokens cofEnv <> p
-}
-
--- cofIsTrue :: CofEnv -> Cof -> Bool
--- cofIsTrue e = implies (globalTokens e) (localTokens e)
-
-cofSelect :: CofEnv -> Cases a -> Maybe a
-cofSelect e = select (globalTokens e) (localTokens e)
-
---- Metavariable environment
-type Equation = Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)
+-- Metavariable environment
+type Equation = (Cof, Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal))
 
 data MetaEnv = MetaEnv {
   termSol :: IM.IntMap (Closure [S.Var] S.Term),
   typeSol :: IM.IntMap (Closure [S.Var] S.Type),
   equations :: [Equation],  -- postponed equations
-  graph :: G.Graph
+  graph :: G.Graph  -- Dependency graph for occurs checking
+  -- todo meta freezing
 } deriving Show
 
 emptyMetaEnv :: MetaEnv
 emptyMetaEnv = MetaEnv IM.empty IM.empty []
   (G.buildG (0,-1) [])
 
-class (Fresh m, MonadState MetaEnv m, MonadError String m) => MonadMEnv m
+-- declarations
+data Entry
+  = Definition S.Type S.Term
+  | Postulate S.Type
+  | Hypothesis S.Type (Bind S.Var Entry)
+  | Locked Cof Entry
+  deriving (Generic, Show)
+instance Alpha Entry
+
+data Decls = Decls {
+  decls :: M.Map String (Maybe Cof, Entry),
+  world :: World,
+  metas :: MetaEnv
+} deriving Show
+
+emptyDecls :: Decls
+emptyDecls = Decls M.empty emptyWorld emptyMetaEnv
+
+class (MonadReader Context m, Fresh m, MonadState Decls m, MonadError String m)
+  => Tyck m
+
+lookupVar :: Tyck m => S.Var -> m Val
+lookupVar v = do
+  res <- asks $ M.lookup v . env
+  case res of
+    Just val -> return val
+    Nothing -> error "lookupLocal: impossible"
+      -- because we already scope checked
+
+lookupCon :: Tyck m => String -> m Entry
+lookupCon c = do
+  res <- gets $ M.lookup c . decls
+  case res of
+    Just (_, val) -> return val
+    Nothing -> error $ "lookupGlobal: unknown constant " ++ c
+
+bindVar :: Tyck m => [(S.Var, Val)] -> m a -> m a
+bindVar bds = local \ctx -> ctx {
+  env = M.fromList bds `M.union` env ctx
+}
+
+bindCof :: Tyck m => Cof -> m a -> m a
+bindCof p = local \ctx -> ctx {
+  cofEnv = cofEnv ctx <> p
+}
+
+selectCases :: Tyck m => Cases a -> m (Maybe a)
+selectCases st = gets (select . world) <*> asks cofEnv <*> return st
+
+{-
+calculateUnfolds :: Env -> [String] -> Cof
+calculateUnfolds e ns = mconcat (map go ns)
+  where
+    go v = case M.lookup v (globalEnv e) of
+      Just (Just c, _) -> c
+      Just (Nothing, _) -> error $ "lookupGlobal: cannot unfold " ++ v
+      Nothing -> error $ "lookupGlobal: unknown constant " ++ v
+
+bindGlobal :: String -> Maybe Cof -> Entry -> Env -> Env
+bindGlobal n p v e = e {
+  globalEnv = M.insert n (p, v) $ globalEnv e
+}
+-}
 
 -- A closure stores an environment.
--- TODO hide the constructor and implement pruning
-data Closure r t = Closure Env CofEnv (Bind r t)
+data Closure r t = Closure Env Cof (Bind r t)
 instance (Show r, Show t) => Show (Closure r t) where
   show (Closure _ _ b) = show b
-closeB :: (Alpha r, Alpha t) => Env -> CofEnv -> Bind r t -> Closure r t
-closeB env cofEnv b = Closure (env {
-  localEnv = M.filterWithKey (\k _ -> anyOf fv (== k) b) (localEnv env)
-}) cofEnv b
+
+-- Produce a closure that additionally filters the environment
+closeB :: (Alpha r, Alpha t, Tyck m) => Bind r t -> m (Closure r t)
+closeB b = asks \ctx -> Closure
+  (M.filterWithKey (\k _ -> anyOf fv (== k) b) (env ctx))
+  (cofEnv ctx) b
+
 getClosureMetas :: (Alpha r, Alpha p) => (p -> IS.IntSet) -> Closure r p -> IS.IntSet
-getClosureMetas f (Closure env _ b) =
-  M.foldMapWithKey (const getMetas) (localEnv env) `IS.union`
+getClosureMetas f (Closure e _ b) =
+  M.foldMapWithKey (const getMetas) e `IS.union`
   f (snd $ unsafeUnbind b)
 
 -- Some metavariables may have been solved; remind us to look up the newest one.
+-- Some neutrals may have also destabilized
 -- Principle: if we immediately want to case split on the variable, then
 -- make the input type a Thunk. Generally always make the output Thunk.
 newtype Thunk a = Thunk { unthunk :: a }
 instance Show a => Show (Thunk a) where
-  showsPrec i (Thunk a) = showsPrec i a
+  showsPrec i = showsPrec i . unthunk
 -- use unthunk to disregard this, and use force to make the update
 
 -- Eliminators
 data Spine
   = App {- -} (Thunk Val)
   | Fst {- -} | Snd {- -}
-  | NatElim (Closure S.Var S.Type) (Closure () S.Term) (Closure (S.Var, S.Var) S.Term) {- -}
+  | NatElim
+    (Closure S.Var S.Type)
+    (Closure () S.Term)
+    (Closure (S.Var, S.Var) S.Term)
+    {- -}
   | Unlock {- -} Cof
   | OutCof Cof (Thunk Val) {- -}
   deriving Show
@@ -216,51 +244,46 @@ toVar :: Val -> Maybe S.Var
 toVar (Var v) = Just v
 toVar _ = Nothing
 
-vMeta :: MonadMEnv m => [Spine] -> Cases (Thunk Val) -> S.MetaVar (Thunk Val) -> m Val
+-- If the metavariable is solved, add the unfolding branch
+vMeta :: Tyck m => [Spine] -> Cases (Thunk Val) -> S.MetaVar (Thunk Val) -> m Val
 vMeta sp st m@(S.MetaVar _ mid subs) = do
-  sol <- gets (IM.lookup mid . termSol)
+  sol <- gets (IM.lookup mid . termSol . metas)
   case sol of
     Just b -> do
       b' <- b $$ (`zip'` map unthunk subs)
       vsol <- vSpine sp b'
       let unfoldCase = SingleCase mempty (Thunk vsol)
-        -- todo add back unfolding meta
-      return $ Flex m sp $ unfoldCase <> st
-    Nothing -> return $ Flex m sp EmptyCases
+        -- todo add back conditions for unfolding meta
+      return $ Flex m sp unfoldCase -- <> st
+    Nothing -> return $ Flex m sp st
 
-vMetaTy :: MonadMEnv m => Cases (Thunk TyVal) -> S.MetaVar (Thunk Val) -> m TyVal
+vMetaTy :: Tyck m => Cases (Thunk TyVal) -> S.MetaVar (Thunk Val) -> m TyVal
 vMetaTy st m@(S.MetaVar _ mid subs) = do
-  sol <- gets (IM.lookup mid . typeSol)
+  sol <- gets (IM.lookup mid . typeSol . metas)
   case sol of
     Just b -> do
       vsol <- b $$: (`zip'` map unthunk subs)
       let unfoldCase = SingleCase mempty (Thunk vsol)
-      return $ MTyVar m $ unfoldCase <> st
+      return $ MTyVar m unfoldCase -- <> st
     Nothing -> return $ MTyVar m st
 
--- TODO does this need stabilization info?
-vCon :: MonadMEnv m => Env -> CofEnv -> [Spine] -> S.Const (Thunk Val) -> m Val
-vCon env cofEnv sp c@(S.Const name subs) = do
-  -- this does not use emptyEnv and emptyCofEnv, because
-  -- the innermost evaluation needs this for the substitution to make sense
-  result <- vCon' env cofEnv (lookupGlobal env name) (map unthunk subs)
+-- evaluates a constant under a substitution
+vCon :: Tyck m => [Spine] -> S.Const (Thunk Val) -> m Val
+vCon sp c@(S.Const name subs) = do
+  entry <- lookupCon name
+  result <- vCon' entry (map unthunk subs)
   Con c sp <$> mapM (\x -> Thunk <$> vSpine sp (unthunk x)) result
 
-vCon' :: MonadMEnv m =>
-  Env -> CofEnv -> GlobalEntry -> [Val] -> m (Cases (Thunk Val))
-vCon' env cofEnv (Hypothesis _ bg) (v:subs) = do
+vCon' :: Tyck m => Entry -> [Val] -> m (Cases (Thunk Val))
+vCon' (Hypothesis _ bg) (v:subs) = do
   (x, g) <- unbind bg
-  vCon' (bindLocal [(x, v)] env) cofEnv g subs
-vCon' env cofEnv (Locked p g) subs
-  -- Huh, the substitution doesn't seem to need these tokens
-  = vCon' env (bindToken p cofEnv) g subs
-vCon' env cofEnv (Definition _ tm) [] = do
-  v <- eval env cofEnv tm
-  return $ SingleCase mempty (Thunk v) -- do I use the cofEnv?
-vCon' _ _ (Postulate _) [] = return EmptyCases
-vCon' _ _ _ _ = error "Impossible"
+  bindVar [(x, v)] $ vCon' g subs
+vCon' (Locked p g) subs = bindCof p $ vCon' g subs
+vCon' (Definition _ tm) [] = SingleCase mempty . Thunk <$> eval tm
+vCon' (Postulate _) [] = return EmptyCases
+vCon' _ _ = error "Impossible"
 
-vSpine :: MonadMEnv m => [Spine] -> Val -> m Val
+vSpine :: Tyck m => [Spine] -> Val -> m Val
 vSpine [] v = return v
 vSpine (c:sp) v0 = do
   v <- vSpine sp v0
@@ -272,7 +295,7 @@ vSpine (c:sp) v0 = do
     Unlock p -> vUnlock v p
     OutCof p u -> return $ vOutCof p u v
 
-vApp :: MonadMEnv m => Val -> Val -> m Val
+vApp :: Tyck m => Val -> Val -> m Val
 vApp fun arg = case fun of
   Lam t' -> t' $$ \x -> [(x, arg)]
   Flex mv sp st ->
@@ -285,7 +308,7 @@ vApp fun arg = case fun of
 
 thApp arg fun = Thunk <$> vApp (unthunk fun) arg
 
-vUnlock :: MonadMEnv m => Val -> Cof -> m Val
+vUnlock :: Tyck m => Val -> Cof -> m Val
 vUnlock t p = case t of
   Lock q t' -> t' $$? q
   Flex mv sp st ->
@@ -334,7 +357,7 @@ vEl :: Val -> TyVal
 vEl (Quote ty) = unthunk ty
 vEl v = El v
 
-vNatElim :: MonadMEnv m
+vNatElim :: Tyck m
   => Closure S.Var S.Type
   -> Closure () S.Term
   -> Closure (S.Var, S.Var) S.Term
@@ -360,134 +383,146 @@ thNatElim m z s x = Thunk <$> vNatElim m z s (unthunk x)
 
 -- If the neutral form destablizes, fetch the resulting value
 -- If the metavariable produced a solution, fetch the solution too
-force :: MonadMEnv m => CofEnv -> Thunk Val -> m Val
-force cofEnv (Thunk m@(Flex (S.MetaVar _ mid subs) sp st)) = do
-  sol <- gets (IM.lookup mid . termSol)
+force :: Tyck m => Thunk Val -> m Val
+force (Thunk m@(Flex (S.MetaVar _ mid subs) sp st)) = do
+  sol <- gets (IM.lookup mid . termSol . metas)
   case sol of
     Just b -> vSpine sp =<< b $$ (`zip'` map unthunk subs)
-    Nothing -> case cofSelect cofEnv st of
-      Just x -> force cofEnv x
-      Nothing -> return m
-force cofEnv (Thunk (Rigid _ _ st))
-  | Just x <- cofSelect cofEnv st = force cofEnv x
-force cofEnv (Thunk (Con _ _ st))
-  | Just x <- cofSelect cofEnv st = force cofEnv x
-force _ (Thunk a) = return a
+    Nothing -> do
+      res <- selectCases st
+      case res of
+        Just x -> force x
+        Nothing -> return m
+force (Thunk m@(Rigid _ _ st)) = do
+  res <- selectCases st
+  case res of
+    Just x -> force x
+    Nothing -> return m
+force (Thunk m@(Con _ _ st)) = do
+  res <- selectCases st
+  case res of
+    Just x -> force x
+    Nothing -> return m
+force (Thunk m) = return m
 
-forceTy :: MonadMEnv m => CofEnv -> Thunk TyVal -> m TyVal
-forceTy cofEnv (Thunk m@(MTyVar (S.MetaVar _ mid subs) st)) = do
-  sol <- gets (IM.lookup mid . typeSol)
+forceTy :: Tyck m => Thunk TyVal -> m TyVal
+forceTy (Thunk m@(MTyVar (S.MetaVar _ mid subs) st)) = do
+  sol <- gets (IM.lookup mid . typeSol . metas)
   case sol of
     Just b -> b $$: (`zip'` map unthunk subs)
-    Nothing -> case cofSelect cofEnv st of
-      Just x -> forceTy cofEnv x
-      Nothing -> return m
-forceTy cofEnv (Thunk (El t)) = vEl <$> force cofEnv (Thunk t)
-forceTy _ (Thunk a) = return a
+    Nothing -> do
+      res <- selectCases st
+      case res of
+        Just x -> forceTy x
+        Nothing -> return m
+forceTy (Thunk (El t)) = vEl <$> force (Thunk t)
+forceTy (Thunk a) = return a
 
 ------ Normalization by evaluation ------
 
-eval :: MonadMEnv m => Env -> CofEnv -> S.Term -> m Val
-eval env cofEnv = \case
-  S.Var x -> return $ lookupLocal env x
-  S.MVar (S.MetaVar name mid subs)
-    -> vMeta [] EmptyCases . S.MetaVar name mid . map Thunk =<<
-      mapM (eval env cofEnv) subs
-  S.Con (S.Const name subs)
-    -> vCon env cofEnv [] . S.Const name . map Thunk =<<
-      mapM (eval env cofEnv) subs
+eval :: Tyck m => S.Term -> m Val
+eval = \case
+  S.Var x -> lookupVar x
+  S.MVar (S.MetaVar name mid subs) ->
+    vMeta [] EmptyCases . S.MetaVar name mid . map Thunk =<< mapM eval subs
+  S.Con (S.Const name subs) ->
+    vCon [] . S.Const name . map Thunk =<< mapM eval subs
   -- Let name clause body
   --   -> eval (bindGlobal name _ env) body
 
-  S.Lam s -> return $ Lam $ closeB env cofEnv s
+  S.Lam s -> Lam <$> closeB s
   S.App t1 t2 -> do
-    v1 <- eval env cofEnv t1
-    v2 <- eval env cofEnv t2
+    v1 <- eval t1
+    v2 <- eval t2
     vApp v1 v2
 
   S.Pair t1 t2 -> do
-    v1 <- eval env cofEnv t1
-    v2 <- eval env cofEnv t2
+    v1 <- eval t1
+    v2 <- eval t2
     return $ Pair (Thunk v1) (Thunk v2)
-  S.Fst t -> vFst <$> eval env cofEnv t
-  S.Snd t -> vSnd <$> eval env cofEnv t
+  S.Fst t -> vFst <$> eval t
+  S.Snd t -> vSnd <$> eval t
 
   S.Zero -> return Zero
-  S.Suc t -> vSuc <$> eval env cofEnv t
+  S.Suc t -> vSuc <$> eval t
   S.NatElim m z s t -> do
-    v <- eval env cofEnv t
-    vNatElim
-      (closeB env cofEnv m)
-      (closeB env cofEnv (bind () z))
-      (closeB env cofEnv s)
-      v
+    cm <- closeB m
+    cz <- closeB (bind () z)
+    cs <- closeB s
+    v <- eval t
+    vNatElim cm cz cs v
 
-  S.Lock p t -> return $ Lock p $ closeB env cofEnv (bind () t)
+  S.Lock p t -> Lock p <$> closeB (bind () t)
   S.Unlock t p -> do
-    v <- eval env (bindToken p cofEnv) t
+    v <- eval t
     vUnlock v p
 
   S.InCof p t -> do
-    v <- eval env cofEnv t
+    v <- eval t
     return $ InCof p (Thunk v)
   S.OutCof p u t -> do
-    vu <- eval env cofEnv u
-    vt <- eval env cofEnv t
+    vu <- eval u
+    vt <- eval t
     return $ vOutCof p (Thunk vu) vt
 
-  S.Quote ty -> Quote . Thunk <$> evalTy env cofEnv ty
-  S.The _ tm -> eval env cofEnv tm
+  S.Quote ty -> Quote . Thunk <$> evalTy ty
+  S.The _ tm -> eval tm
 
-evalTy :: MonadMEnv m => Env -> CofEnv -> S.Type -> m TyVal
-evalTy env cofEnv = \case
-  S.MTyVar (S.MetaVar name mid subs)
-    -> vMetaTy EmptyCases . S.MetaVar name mid . map Thunk =<<
-      mapM (eval env cofEnv) subs
+evalTy :: Tyck m => S.Type -> m TyVal
+evalTy = \case
+  S.MTyVar (S.MetaVar name mid subs) ->
+    vMetaTy EmptyCases . S.MetaVar name mid . map Thunk =<< mapM eval subs
   S.Sigma t1 t2 -> do
-    v1 <- evalTy env cofEnv t1
-    return $ Sigma (Thunk v1) (closeB env cofEnv t2)
+    v1 <- evalTy t1
+    Sigma (Thunk v1) <$> closeB t2
   S.Pi t1 t2 -> do
-    v1 <- evalTy env cofEnv t1
-    return $ Pi (Thunk v1) (closeB env cofEnv t2)
+    v1 <- evalTy t1
+    Pi (Thunk v1) <$> closeB t2
   S.Nat -> return Nat
-  S.Pushforward p ty -> return $ Pushforward p (closeB env cofEnv (bind () ty))
+  S.Pushforward p ty -> Pushforward p <$> closeB (bind () ty)
   S.Ext ty p tm -> do
-    vty <- evalTy env cofEnv ty
-    return $ Ext (Thunk vty) p (closeB env cofEnv (bind () tm))
+    vty <- evalTy ty
+    Ext (Thunk vty) p <$> closeB (bind () tm)
   S.Universe -> return Universe
-  S.El t -> vEl <$> eval env cofEnv t
+  S.El t -> vEl <$> eval t
 
 -- Helpers for evaluating closures
+withContext :: Tyck m => Env -> Cof -> m a -> m a
+withContext e c = local (const Context {
+  env = e,
+  cofEnv = c,
+  rvars = []
+})
 
-($$+) :: (MonadMEnv m, Alpha p) => Closure p S.Term -> (p -> [(S.Var, Val)]) -> m (p, Val)
+($$+) :: (Tyck m, Alpha p) => Closure p S.Term -> (p -> [(S.Var, Val)]) -> m (p, Val)
 Closure env cofEnv t $$+ r = do
   (x, s) <- unbind t
-  s' <- eval (bindLocal (r x) env) cofEnv s
+  s' <- withContext env cofEnv $ bindVar (r x) $ eval s
   return (x, s')
 
-($$) :: (MonadMEnv f, Alpha a) => Closure a S.Term -> (a -> [(S.Var, Val)]) -> f Val
+($$) :: (Tyck f, Alpha a) => Closure a S.Term -> (a -> [(S.Var, Val)]) -> f Val
 t $$ r = snd <$> t $$+ r
 
-($$?) :: (MonadMEnv m) => Closure () S.Term -> Cof -> m Val
+($$?) :: (Tyck m) => Closure () S.Term -> Cof -> m Val
 Closure env cofEnv t $$? p = do
   (_, s) <- unbind t
-  eval env (bindToken p cofEnv) s
+  withContext env cofEnv $ bindCof p $ eval s
 
-($$:+) :: (MonadMEnv m, Alpha p) => Closure p S.Type -> (p -> [(S.Var, Val)]) -> m (p, TyVal)
+($$:+) :: (Tyck m, Alpha p) => Closure p S.Type -> (p -> [(S.Var, Val)]) -> m (p, TyVal)
 Closure env cofEnv t $$:+ r = do
   (x, s) <- unbind t
-  s' <- evalTy (bindLocal (r x) env) cofEnv s
+  s' <- withContext env cofEnv $ bindVar (r x) $ evalTy s
   return (x, s')
 
-($$:) :: (MonadMEnv f, Alpha a) => Closure a S.Type -> (a -> [(S.Var, Val)]) -> f TyVal
+($$:) :: (Tyck f, Alpha a) => Closure a S.Type -> (a -> [(S.Var, Val)]) -> f TyVal
 t $$: r = snd <$> t $$:+ r
 
-reifySp :: MonadMEnv m => CofEnv -> [Spine] -> S.Term -> m S.Term
-reifySp _ [] val = return val
-reifySp cofEnv (c:sp) val0 = do
-  val <- reifySp cofEnv sp val0
+reifySp :: Tyck m => [Spine] -> S.Term -> m S.Term
+reifySp [] val = return val
+reifySp (c:sp) val0 = do
+  val <- reifySp sp val0
   case c of
-    App thunk -> S.App val <$> (reify cofEnv =<< force cofEnv thunk)
+    App thunk -> S.App val <$> (reify =<< force thunk)
     Fst -> return $ S.Fst val
     Snd -> return $ S.Snd val
     NatElim cm cz cs -> do -- TODO should we not normalize the motive?
@@ -499,91 +534,78 @@ reifySp cofEnv (c:sp) val0 = do
       return $ S.NatElim tym tz' ts val
     Unlock p -> return $ S.Unlock val p
     OutCof p u -> do
-      vu <- force cofEnv u
-      tu <- reify cofEnv vu
+      vu <- force u
+      tu <- reify vu
       return $ S.OutCof p tu val
 
-reify :: MonadMEnv m => CofEnv -> Val -> m S.Term
+reify :: Tyck m => Val -> m S.Term
 -- We assume these are already forced
-reify cofEnv (Rigid v sp _) = reifySp cofEnv sp (S.Var v)
-reify cofEnv (Flex (S.MetaVar name mid subs) sp _)
-  = reifySp cofEnv sp . S.MVar . S.MetaVar name mid =<<
-    mapM (reify cofEnv <=< force cofEnv) subs
-reify cofEnv (Con (S.Const name subs) sp _)
-  = reifySp cofEnv sp . S.Con . S.Const name =<<
-    mapM (reify cofEnv <=< force cofEnv) subs
+reify (Rigid v sp _) = reifySp sp (S.Var v)
+reify (Flex (S.MetaVar name mid subs) sp _)
+  = reifySp sp . S.MVar . S.MetaVar name mid =<<
+    mapM (reify <=< force) subs
+reify (Con (S.Const name subs) sp _)
+  = reifySp sp . S.Con . S.Const name =<<
+    mapM (reify <=< force) subs
 
-reify _ (Lam c) = S.Lam <$> c $$- \x -> [(x, Var x)]
-reify cofEnv (Pair th1 th2) = do
-  v1 <- force cofEnv th1
-  v2 <- force cofEnv th2
-  S.Pair <$> reify cofEnv v1 <*> reify cofEnv v2
+reify (Lam c) = S.Lam <$> c $$- \x -> [(x, Var x)]
+reify (Pair th1 th2) = do
+  v1 <- force th1
+  v2 <- force th2
+  S.Pair <$> reify v1 <*> reify v2
 
-reify _ Zero = return S.Zero
-reify cofEnv (Suc k th) = nTimes k S.Suc <$> (reify cofEnv =<< force cofEnv th)
+reify Zero = return S.Zero
+reify (Suc k th) = nTimes k S.Suc <$> (reify =<< force th)
 
-reify _ (Lock p c) = S.Lock p <$> c $$?- p
+reify (Lock p c) = S.Lock p <$> c $$?- p
 
-reify cofEnv (InCof p th) = S.InCof p <$> (reify cofEnv =<< force cofEnv th)
+reify (InCof p th) = S.InCof p <$> (reify =<< force th)
 
-reify cofEnv (Quote thty) = S.Quote <$> (reifyTy cofEnv =<< forceTy cofEnv thty)
+reify (Quote thty) = S.Quote <$> (reifyTy =<< forceTy thty)
 
-reifyTy :: MonadMEnv m => CofEnv -> TyVal -> m S.Type
--- reflection
-reifyTy cofEnv (MTyVar (S.MetaVar name mid subs) _)
+reifyTy :: Tyck m => TyVal -> m S.Type
+reifyTy (MTyVar (S.MetaVar name mid subs) _)
   = S.MTyVar . S.MetaVar name mid <$>
-    mapM (reify cofEnv <=< force cofEnv) subs
+    mapM (reify <=< force) subs
 
--- reification
-reifyTy cofEnv (Sigma thty c) = do
-  ty <- reifyTy cofEnv =<< forceTy cofEnv thty
+reifyTy (Sigma thty c) = do
+  ty <- reifyTy =<< forceTy thty
   t <- c $$:- \x -> [(x, Var x)]
   return $ S.Sigma ty t
-reifyTy cofEnv (Pi thty c) = do
-  ty <- reifyTy cofEnv =<< forceTy cofEnv thty
+reifyTy (Pi thty c) = do
+  ty <- reifyTy =<< forceTy thty
   t <- c $$:- \x -> [(x, Var x)]
   return $ S.Pi ty t
-reifyTy _ Nat = return S.Nat
-reifyTy _ (Pushforward p c) = S.Pushforward p <$> c $$:?- p
-reifyTy cofEnv (Ext thty p c) = do
-  ty <- reifyTy cofEnv =<< forceTy cofEnv thty
+reifyTy Nat = return S.Nat
+reifyTy (Pushforward p c) = S.Pushforward p <$> c $$:?- p
+reifyTy (Ext thty p c) = do
+  ty <- reifyTy =<< forceTy thty
   S.Ext ty p <$> c $$?- p
-reifyTy _ Universe = return S.Universe
-reifyTy cofEnv (El tm) = S.El <$> reify cofEnv tm
+reifyTy Universe = return S.Universe
+reifyTy (El tm) = S.El <$> reify tm
 
-($$-) :: (MonadMEnv m, Alpha p) => Closure p S.Term -> (p -> [(S.Var, Val)]) -> m (Bind p S.Term)
-Closure env cofEnv t $$- r = do
+($$-) :: (Tyck m, Alpha p) => Closure p S.Term -> (p -> [(S.Var, Val)]) -> m (Bind p S.Term)
+Closure env cofEnv t $$- r = withContext env cofEnv do
   (x, s) <- unbind t
-  s' <- eval (bindLocal (r x) env) cofEnv s
-  t' <- reify cofEnv =<< force cofEnv (Thunk s')
+  s' <- bindVar (r x) $ eval s
+  t' <- reify =<< force (Thunk s')
   return (bind x t')
 
-($$:-) :: (MonadMEnv m, Alpha p) => Closure p S.Type -> (p -> [(S.Var, Val)]) -> m (Bind p S.Type)
-Closure env cofEnv t $$:- r = do
+($$:-) :: (Tyck m, Alpha p) => Closure p S.Type -> (p -> [(S.Var, Val)]) -> m (Bind p S.Type)
+Closure env cofEnv t $$:- r = withContext env cofEnv do
   (x, s) <- unbind t
-  s' <- evalTy (bindLocal (r x) env) cofEnv s
-  t' <- reifyTy cofEnv =<< forceTy cofEnv (Thunk s')
+  s' <- bindVar (r x) $ evalTy s
+  t' <- reifyTy =<< forceTy (Thunk s')
   return (bind x t')
 
-($$?-) :: MonadMEnv m => Closure () S.Term -> Cof -> m S.Term
-Closure env cofEnv t $$?- p = do
+($$?-) :: Tyck m => Closure () S.Term -> Cof -> m S.Term
+Closure env cofEnv t $$?- p = withContext env cofEnv $ bindCof p do
   (_, s) <- unbind t
-  s' <- eval env (bindToken p cofEnv) s
-  reify (bindToken p cofEnv) =<< force (bindToken p cofEnv) (Thunk s')
+  s' <- eval s
+  reify =<< force (Thunk s')
 
-($$:?-) :: MonadMEnv m => Closure () S.Type -> Cof -> m S.Type
-Closure env cofEnv t $$:?- p = do
+($$:?-) :: Tyck m => Closure () S.Type -> Cof -> m S.Type
+Closure env cofEnv t $$:?- p = withContext env cofEnv $ bindCof p do
   (_, s) <- unbind t
-  s' <- evalTy env (bindToken p cofEnv) s
-  reifyTy (bindToken p cofEnv) =<< forceTy (bindToken p cofEnv) (Thunk s')
-
----- Example monad to use the functions ----
-type MetaEnvM = StateT MetaEnv (ExceptT String FreshM)
-instance MonadMEnv MetaEnvM
-runMetaEnvM :: MetaEnvM a -> Either String a
-runMetaEnvM m = runFreshM $ runExceptT (evalStateT m emptyMetaEnv)
-
-nf :: Env -> CofEnv -> S.Term -> Either String S.Term
-nf env cofEnv t = runMetaEnvM $ do
-  v <- eval env cofEnv t
-  reify cofEnv v
+  s' <- evalTy s
+  reifyTy  =<< forceTy (Thunk s')

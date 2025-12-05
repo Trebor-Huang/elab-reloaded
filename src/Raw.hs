@@ -1,7 +1,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wno-unused-do-bind #-}
 module Raw (
-  Var, Raw (..), Judgment (..),
+  Var, Raw (..), Judgment (..), TopLevel (..),
   parseString
 ) where
 import Unbound.Generics.LocallyNameless
@@ -79,7 +79,8 @@ pIdent_ = try (do
   x0 <- C.letterChar
   guard $ x0 /= 'λ'
   x <- takeWhileP Nothing (\x -> C.isAlphaNum x || (x == '\''))
-  guard $ notElem (x0:x) ["define", "postulate", "eval"] -- keywords
+  guard $ notElem (x0:x)
+    ["define", "opaque", "abbrev", "unfolding", "postulate", "eval"] -- keywords
   return (x0:x)) <?> "identifier"
 
 pIdent :: Parser String
@@ -208,74 +209,100 @@ toRaw _ _ (TNode v _) = throwError $ "Unrecognized identifier: " ++ v
 postulate
   x : A ; y : B ⊢ c : C
 
-define
+define unfolding {p, q}
   x : A ; y : B ⊢ c : C
     = E
 
 eval E'
 -}
 
-type ParseJudgment = ([(Identifier, ParseTree)], Identifier, ParseTree)
+data ParseJudgment = ParseJudgment {
+  unfoldingP :: [Identifier],
+  argP :: [(Identifier, ParseTree)],
+  nameP :: Identifier,
+  typeP :: ParseTree
+}
 data Judgment
   = Postulate Raw
-  | Definition Raw Raw
+  | Definition (Ignore Unfolding) Raw Raw
   | Hypothesis Raw (Bind Var Judgment)
   deriving (Generic, Show)
 instance Alpha Judgment
 instance Subst Raw Judgment
 
+parseUnfolding :: Parser [Identifier]
+parseUnfolding = do
+  symbol "unfolding"
+  char '{'
+  r <- pIdent `sepBy` char ','
+  char '}'
+  return r
+
 parseJudgment :: Parser ParseJudgment
 parseJudgment = do
+  cs <- parseUnfolding <|> return []
   scopes <- do
     args <- ((,) <$> some pBinder <*> (char ':' *> pRaw)) `sepBy` char ';'
     return [ (v, rty) | (vs, rty) <- args , v <- vs ]
   (symbol "|-" <|> symbol "⊢") <?> "turnstile"
   c <- pIdent
   char ':'
-  cty <- pRaw
-  return (scopes, c, cty)
+  ParseJudgment cs scopes c <$> pRaw
 
-parseDef :: Parser (ParseJudgment, ParseTree)
+parseDef :: Parser (Unfolding, ParseJudgment, ParseTree)
 parseDef = do
-  symbol "define"
+  u <-
+    (Controlled <$ symbol "define") <|>
+    (Opaque <$ symbol "opaque") <|>
+    (Transparent <$ symbol "abbrev")
   j <- parseJudgment
   char '='
   expr <- pRaw
-  return (j, expr)
+  return (u, j, expr)
 
 parsePostulate :: Parser ParseJudgment
 parsePostulate = do
   symbol "postulate"
   parseJudgment
 
-parseTop :: [Identifier] -> Parser (Judgment, Identifier)
+data TopLevel = TopLevel {
+  judgment :: Judgment,
+  unfolding :: [Identifier],
+  name :: Identifier
+}
+
+parseTop :: [Identifier] -> Parser TopLevel
 parseTop cenv = do
-    ((pJ, name, pty), ptm) <- parseDef
-    case runExcept $ runFreshMT $ go pJ [] pty (Just ptm) of
-      Right j -> return (j, name)
+    (u, pJ, ptm) <- parseDef
+    guard (all (`elem` cenv) $ unfoldingP pJ)
+    case runExcept $ runFreshMT $
+      go (argP pJ) [] (typeP pJ) (Just (u, ptm)) of
+      Right j -> return $ TopLevel j (unfoldingP pJ) (nameP pJ)
       Left s -> fail s
   <|> do
-    (pJ, name, pty) <- parsePostulate
-    case runExcept $ runFreshMT $ go pJ [] pty Nothing of
-      Right j -> return (j, name)
+    pJ <- parsePostulate
+    guard (all (`elem` cenv) $ unfoldingP pJ)
+    case runExcept $ runFreshMT $
+      go (argP pJ) [] (typeP pJ) Nothing of
+      Right j -> return $ TopLevel j (unfoldingP pJ) (nameP pJ)
       Left s -> fail s
   where
     go :: [(Identifier, ParseTree)]
       -> [(Identifier, Var)]
-      -> ParseTree -> Maybe ParseTree
+      -> ParseTree -> Maybe (Unfolding, ParseTree)
       -> FreshMT (Except String) Judgment
     go [] scope pty mtm = do
       rty <- toRaw cenv scope pty
       case mtm of
         Nothing -> return $ Postulate rty
-        Just ptm -> Definition rty <$> toRaw cenv scope ptm
+        Just (u, ptm) -> Definition (ignore u) rty <$> toRaw cenv scope ptm
     go ((x,xpty):cs) scope pty mtm = do
       xrty <- toRaw cenv scope xpty
       v <- fresh $ s2n x
       res <- go cs (pushVar x v scope) pty mtm
       return $ Hypothesis xrty (bind v res)
 
-parseFile :: Parser ([(Judgment, Identifier)], Raw)
+parseFile :: Parser ([TopLevel], Raw)
 parseFile = spaceEater *> go [] <* eof
   where
     go cenv = do
@@ -285,11 +312,11 @@ parseFile = spaceEater *> go [] <* eof
           Right rtm -> return ([], rtm)
           Left err -> fail err
       <|> do
-        (j, x) <- parseTop cenv
-        (js, rtm) <- go (x:cenv)
-        return ((j,x):js, rtm)
+        top <- parseTop cenv
+        (js, rtm) <- go (name top:cenv)
+        return (top:js, rtm)
 
-parseString :: String -> IO ([(Judgment, Identifier)], Raw)
+parseString :: String -> IO ([TopLevel], Raw)
 parseString src =
   case parse parseFile "(stdin)" src of
     Left e -> do

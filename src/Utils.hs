@@ -32,3 +32,5 @@ insertNode g i k = g A.// [(i, k)]
 newNode :: G.Graph -> (Int, G.Graph)
 newNode g = let (l, r) = A.bounds g in
   (r+1, A.array (l,r+1) ((r+1,[]):[(i, g A.! i) | i <- A.range (l,r)]))
+
+data Unfolding = Opaque | Controlled | Transparent deriving (Eq, Show)

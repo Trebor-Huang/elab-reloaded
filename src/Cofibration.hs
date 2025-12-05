@@ -34,6 +34,14 @@ newtype Cof = Cof (Ignore (IM.IntMap String)) -- a list for conjunctions
 instance Alpha Cof
 instance Subst a Cof
 
+instance Eq Cof where
+  Cof p == Cof q = -- coarse equality
+    let
+      u = IM.keysSet (unignore p)
+      v = IM.keysSet (unignore q)
+    in
+      u == v
+
 instance Semigroup Cof where
   Cof p <> Cof q = Cof $ ignore $ IM.union (unignore p) (unignore q)
 

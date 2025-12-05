@@ -1,7 +1,8 @@
+{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 module TypeCheck (
-  TyckM, runTyckM, evalTyckM, emptyContext,
-  check, checkTy, infer, conv, convTy,
-  zonk, zonkTy, processFile
+  -- TyckM, runTyckM, evalTyckM, emptyContext,
+  -- check, checkTy, infer, conv, convTy,
+  -- zonk, zonkTy, processFile
 ) where
 import Control.Monad.State
 import Control.Monad.Except
@@ -11,6 +12,7 @@ import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import qualified Data.IntSet as IS
 import Data.Coerce (coerce)
+import Debug.Trace (trace)
 
 import qualified Raw as R
 import Raw (Raw)
@@ -19,128 +21,77 @@ import qualified NbE as V
 import NbE (Val, TyVal, Spine)
 import NbE hiding (Val(..), TyVal(..), Spine(..))
 import Utils
-import Debug.Trace (trace)
+import Cofibration
 
-data Context = Context {
-  env :: !Env,  -- environment for evaluation
-  cofEnv :: !CofEnv,
-  rvars :: [(R.Var, Thunk TyVal)]  -- types of raw variables
-} deriving Show
 
-emptyContext :: Context
-emptyContext = Context emptyEnv emptyCofEnv []
-
-newVar :: R.Var -> Var -> Thunk TyVal -> Context -> Context
-newVar vraw var ty ctx = ctx {
-  env = bindLocal [(var, V.Var var)] (env ctx),
-  rvars = (vraw, ty) : rvars ctx
-}
-
-bindEnv :: Var -> Val -> Context -> Context
-bindEnv var val ctx = ctx {
-  env = bindLocal [(var, val)] (env ctx)
-}
-
--- bindCofEnv :: Cof -> Context -> Context
--- bindCofEnv p ctx = ctx {
---   cofEnv = bindToken p (cofEnv ctx)
--- }
-
-declareConst :: String -> GlobalEntry
+{-
+declareConst :: String -> Maybe Cof -> Entry
   -> Context -> Context
-declareConst name val ctx = ctx {
-  env = bindGlobal name val (env ctx)
-}
-
-class (MonadReader Context m, MonadMEnv m) => Tyck m
+declareConst name unfolds val ctx =
+  ctx {
+    -- either directly binds this, or declare a new constant less than this
+    env = bindGlobal name unfolds val (env ctx)
+  }
+-}
 
 -- Prepare some primitive operations
-evalM :: (MonadReader Context m, MonadMEnv m) => Term -> m Val
-evalM tm = do
-  Context {env = e, cofEnv = c} <- ask
-  eval e c tm
-
-evalTyM :: (MonadReader Context m, MonadMEnv m) => Type -> m TyVal
-evalTyM ty = do
-  Context {env = e, cofEnv = c} <- ask
-  evalTy e c ty
-
-reifyM :: (MonadReader Context m, MonadMEnv m) => Val -> m Term
-reifyM tm = do
-  c <- asks cofEnv
-  reify c tm
-
-reifyTyM :: (MonadReader Context m, MonadMEnv m) => TyVal -> m Type
-reifyTyM ty = do
-  c <- asks cofEnv
-  reifyTy c ty
-
-forceM :: (MonadReader Context m, MonadMEnv m) => Thunk Val -> m Val
-forceM v = do
-  c <- asks cofEnv
-  force c v
-
-forceTyM :: (MonadReader Context m, MonadMEnv m) => Thunk TyVal -> m TyVal
-forceTyM v = do
-  c <- asks cofEnv
-  forceTy c v
-
--- freshMeta :: MonadMEnv m => String -> [a] -> m (MetaVar a)
--- freshMeta name env = do
---   state <- get
---   put state { nextMVar = nextMVar state + 1 }
---   return $ MetaVar name (nextMVar state) env
+newVar :: Tyck m => R.Var -> Var -> Thunk TyVal -> m a -> m a
+newVar vraw var ty = bindVar [(var, V.Var var)] . local \ctx -> ctx {
+  rvars = (vraw, ty) : rvars ctx
+}
 
 freshAnonMeta :: Tyck m => m (MetaVar Term)
 freshAnonMeta = do
   vs <- asks rvars
   st <- get
-  let (ix, g) = newNode $ graph st
-  put st { graph = g }
+  let (ix, g) = newNode $ graph (metas st)
+  put st { metas = (metas st) { graph = g } }
   return $ MetaVar
     ("?" ++ show ix) ix (map (Var . coerce . fst) vs)
 
-insertTermSol :: MonadMEnv m => Int -> Closure [Var] Term -> m ()
+insertTermSol :: Tyck m => Int -> Closure [Var] Term -> m ()
 insertTermSol i s = trace (show i ++ " == " ++ show s) do
-  -- todo better error reporting
-  menv <- get
-  let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getMetas s)
+  st <- get
+  let newGraph = insertNode (graph (metas st)) i (IS.toList $ getClosureMetas getMetas s)
   trace (show newGraph) if hasCycle newGraph then
     throwError "Occurs check"
-  else do
-    put menv {
-      termSol = IM.insertWith (error "Repeated solution")
-        i s (termSol menv),
-      graph = newGraph
+  else
+    put st {
+      metas = (metas st) {
+        termSol = IM.insertWith (error "Repeated solution")
+          i s (termSol (metas st)),
+        graph = newGraph
+      }
     }
 
-insertTypeSol :: MonadMEnv m => Int -> Closure [Var] Type -> m ()
-insertTypeSol i s = trace (show i ++ " :== " ++ show s) do
-  menv <- get
-  let newGraph = insertNode (graph menv) i (IS.toList $ getClosureMetas getTyMetas s)
-  if hasCycle newGraph then
+insertTypeSol :: Tyck m => Int -> Closure [Var] Type -> m ()
+insertTypeSol i s = trace (show i ++ " == " ++ show s) do
+  st <- get
+  let newGraph = insertNode (graph (metas st)) i (IS.toList $ getClosureMetas getTyMetas s)
+  trace (show newGraph) if hasCycle newGraph then
     throwError "Occurs check"
-  else do
-    put menv {
-      typeSol = IM.insertWith (error "Repeated solution")
-        i s (typeSol menv),
-      graph = newGraph
+  else
+    put st {
+      metas = (metas st) {
+        typeSol = IM.insertWith (error "Repeated solution")
+          i s (typeSol (metas st)),
+        graph = newGraph
+      }
     }
 
 closeM :: (Tyck m, Alpha a) => a -> Thunk Val -> m (Closure a Term)
 closeM a th = do
-  t <- forceM th
-  ctx <- ask
-  tm <- reify (cofEnv ctx) t
-  return $ closeB (env ctx) (cofEnv ctx) (bind a tm)
+  t <- force th
+  tm <- reify t
+  closeB (bind a tm)
 
 closeTyM :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
 closeTyM a th = do
-  t <- forceTyM th
-  ctx <- ask
-  ty <- reifyTy (cofEnv ctx) t
-  return (closeB (env ctx) (cofEnv ctx) (bind a ty))
+  t <- forceTy th
+  ty <- reifyTy  t
+  closeB (bind a ty)
 
+---- Bidirectional type checking ----
 check :: Tyck m => Raw -> TyVal -> m Term
 check R.Hole _ =
   MVar <$> freshAnonMeta
@@ -149,13 +100,13 @@ check (R.Lam f) (V.Pi thdom cod) = do
   (x, t) <- unbind f
   let x' = coerce x :: Var
   ty <- cod $$: \y -> [(y, V.Var x')]
-  t' <- local (newVar x x' thdom) $ check t ty
+  t' <- newVar x x' thdom $ check t ty
   return $ Lam $ bind x' t'
 
 check (R.Pair s1 s2) (V.Sigma th1 t2) = do
-  t1 <- forceTyM th1
+  t1 <- forceTy th1
   s1' <- check s1 t1
-  v1 <- evalM s1'
+  v1 <- eval s1'
   t2' <- t2 $$: \y -> [(y, v1)]
   s2' <- check s2 t2'
   return $ Pair s1' s2'
@@ -166,82 +117,83 @@ check (R.Suc t) V.Nat = Suc <$> check t V.Nat
 
 check tm ty = do
   (tm', thty') <- infer tm
-  unify [Right (Thunk ty, thty')]
+  unify' [Right (Thunk ty, thty')]
   return tm'
 
 checkTy :: Tyck m => Raw -> m Type  -- this should give a level too?
 checkTy (R.Pi rdom rc) = do
   dom <- checkTy rdom
-  vdom <- evalTyM dom
+  vdom <- evalTy dom
   (x, rcod) <- unbind rc
   let x' = coerce x :: Var
-  cod <- local (newVar x x' (Thunk vdom)) $ checkTy rcod
+  cod <- newVar x x' (Thunk vdom) $ checkTy rcod
   return (Pi dom (bind x' cod)) -- ?
 checkTy (R.Sigma rty1 rc) = do
   ty1 <- checkTy rty1
-  vty1 <- evalTyM ty1
+  vty1 <- evalTy ty1
   (x, rty2) <- unbind rc
   let x' = coerce x :: Var
-  ty2 <- local (newVar x x' (Thunk vty1)) $ checkTy rty2
+  ty2 <- newVar x x' (Thunk vty1) $ checkTy rty2
   return (Sigma ty1 (bind x' ty2))
 checkTy R.Nat = return Nat
 checkTy R.Universe = return Universe
 checkTy R.Hole = MTyVar <$> freshAnonMeta
 checkTy rtm = El <$> check rtm V.Universe
 
-checkJudgment :: Tyck m => R.Judgment -> m GlobalEntry
-checkJudgment (R.Postulate rty) = do
+checkJudgment :: Tyck m => [String] -> R.Judgment -> m Entry
+checkJudgment unfolding (R.Postulate rty) = do
   ty <- checkTy rty
   return $ Postulate ty
-checkJudgment (R.Definition rty rtm) = do
+checkJudgment unfolding (R.Definition _ rty rtm) = do -- todo
   ty <- checkTy rty
-  vty <- evalTyM ty
+  vty <- evalTy ty
   tm <- check rtm vty
   return $ Definition ty tm
-checkJudgment (R.Hypothesis rty bj) = do
+checkJudgment unfolding (R.Hypothesis rty bj) = do
   ty <- checkTy rty
-  vty <- evalTyM ty
+  vty <- evalTy ty
   (x, j) <- unbind bj
   let x' = coerce x :: Var
-  entry <- local (newVar x x' (Thunk vty)) $ checkJudgment j
+  entry <- newVar x x' (Thunk vty) $ checkJudgment unfolding j
   return $ Hypothesis ty $ bind x' entry
 
 infer :: Tyck m => Raw -> m (Term, Thunk TyVal)
 infer R.Hole = do
   m <- freshAnonMeta
   mty <- freshAnonMeta
-  vty <- evalTyM (MTyVar mty)
+  vty <- evalTy (MTyVar mty)
   return (MVar m, Thunk vty)
 
 infer (R.Con name args) = do
-  ge <- asks (globalEnv . env)
+  -- todo insert outCof constructor here
+  ge <- gets decls
   case M.lookup name ge of
     Nothing -> error "Impossible: constant not found"
-    Just entry -> do
+    Just (_, entry) -> do
       (targs, ty) <- go entry args
       return (Con (Const name targs), ty)
   where
-    go :: Tyck m => GlobalEntry -> [Raw] -> m ([Term], Thunk TyVal)
+    go :: Tyck m => Entry -> [Raw] -> m ([Term], Thunk TyVal)
     -- check arguments
     go (Hypothesis ty bentry) (rtm:rtms) = do
-      vty <- evalTyM ty
+      vty <- evalTy ty
       tm <- check rtm vty
       (x, entry) <- unbind bentry
-      vtm <- evalM tm
-      (tms, thty) <- local (bindEnv x vtm) $ go entry rtms
+      vtm <- eval tm
+      (tms, thty) <- bindVar [(x, vtm)] $ go entry rtms
       return (tm:tms, thty)
     -- substitute to get type
     go (Definition ty _) [] = do
-      vty <- evalTyM ty
+      vty <- evalTy ty
       return ([], Thunk vty)
     go (Postulate ty) [] = do
-      vty <- evalTyM ty
+      vty <- evalTy ty
       return ([], Thunk vty)
     go _ _ = throwError "Wrong number of arguments"
 
 infer (R.The rty rtm) = do
   ty <- checkTy rty
-  vty <- evalTyM ty
+  vty <- evalTy ty
   tm <- check rtm vty
   return (The ty tm, Thunk vty)
 
@@ -253,22 +205,22 @@ infer (R.Var x) = do
 
 infer (R.App rfun rarg) = do
   (fun, thty) <- infer rfun
-  ty <- forceTyM thty
+  ty <- forceTy thty
   (dom, cod) <- case ty of
     V.Pi thdom cod -> do
-      dom <- forceTyM thdom
+      dom <- forceTy thdom
       return (dom, cod)
     _ -> expectPiSigma True ty
   arg <- check rarg dom
-  varg <- evalM arg
+  varg <- eval arg
   vcod <- cod $$: \y -> [(y, varg)]
   return (App fun arg, Thunk vcod)
 infer (R.Lam f) = do
   mdom <- freshAnonMeta
-  vdom <- Thunk <$> evalTyM (MTyVar mdom)
+  vdom <- Thunk <$> evalTy (MTyVar mdom)
   (x, rt) <- unbind f
   let x' = coerce x :: Var
-  (t, vcod) <- local (newVar x x' vdom) $ infer rt
+  (t, vcod) <- newVar x x' vdom $ infer rt
   cod <- closeTyM x' vcod
   return (Lam $ bind x' t, Thunk $ V.Pi vdom cod)
 infer rty@R.Pi {} = do
@@ -277,7 +229,7 @@ infer rty@R.Pi {} = do
 
 infer (R.Fst r) = do
   (t, th) <- infer r
-  ty <- forceTyM th
+  ty <- forceTy th
   case ty of
     V.Sigma ty1 _ -> return (Fst t, ty1)
     _ -> do
@@ -285,20 +237,20 @@ infer (R.Fst r) = do
       return (Fst t, Thunk ty1)
 infer (R.Snd r) = do
   (t, th) <- infer r
-  ty <- forceTyM th
+  ty <- forceTy th
   ty2 <- case ty of
     V.Sigma _ ty2 -> return ty2
     _ -> snd <$> expectPiSigma False ty
-  varg <- evalM (Fst t)
+  varg <- eval (Fst t)
   sty2 <- ty2 $$: \y -> [(y, varg)]
   return (Snd t, Thunk sty2)
 infer (R.Pair t1 t2) = do
   mt1 <- freshAnonMeta
-  ty1 <- evalTyM (MTyVar mt1)
+  ty1 <- evalTy (MTyVar mt1)
   z <- fresh (s2n "z")
-  bt2 <- local (bindEnv z (V.Var z)) do
+  bt2 <- bindVar [(z, V.Var z)] do
     mt2 <- freshAnonMeta
-    evalTyM (MTyVar mt2)
+    evalTy (MTyVar mt2)
   ty2 <- closeTyM z (Thunk bt2)
   let ty = V.Sigma (Thunk ty1) ty2
   t <- check (R.Pair t1 t2) ty
@@ -317,24 +269,27 @@ infer (R.NatElim rmc rz rsc rarg) = do
   -- check motive
   (n, rm) <- unbind rmc
   let n' = coerce n :: Var
-  tym <- local (newVar n n' (Thunk V.Nat)) $ checkTy rm
+  tym <- newVar n n' (Thunk V.Nat) $ checkTy rm
   -- check zero argument
-  tym_z <- local (bindEnv n' V.Zero) $ evalTyM tym
+  tym_z <- bindVar [(n', V.Zero)] $ evalTy tym
   tz <- check rz tym_z
   -- check suc argument
   ((x, r), rs) <- unbind rsc
   let x' = coerce x :: Var
   let r' = coerce r :: Var
-  tyr_s <- local (bindEnv n' (V.Var x')) $ evalTyM tym
-  tym_s <- local (bindEnv n' (V.Suc 1 (Thunk (V.Var x')))) $ evalTyM tym
-  ts <- local (newVar x x' (Thunk V.Nat) . newVar r r' (Thunk tyr_s))
+  tyr_s <- bindVar [(n', V.Var x')] $ evalTy tym
+  tym_s <- bindVar [(n', V.Suc 1 (Thunk (V.Var x')))] $ evalTy tym
+  ts <- newVar x x' (Thunk V.Nat)
+    $ newVar r r' (Thunk tyr_s)
     $ check rs tym_s
   -- evaluate the type
-  varg <- evalM arg
-  ty <- local (bindEnv n' varg) $ evalTyM tym
+  varg <- eval arg
+  ty <- bindVar [(n', varg)] $ evalTy tym
   return (NatElim (bind n' tym) tz (bind (x', r') ts) arg, Thunk ty)
 infer R.Nat = return (Quote Nat, Thunk V.Universe)
   -- since it's just one step we can inline it
+
+-- todo other infer
 
 infer R.Universe = return (Quote Universe, Thunk V.Universe)
   -- todo add universe constraint (i.e. don't inline this)
@@ -342,13 +297,13 @@ infer R.Universe = return (Quote Universe, Thunk V.Universe)
 expectPiSigma :: Tyck m => Bool -> TyVal -> m (TyVal, Closure Var Type)
 expectPiSigma b ty = do
   mdom <- freshAnonMeta
-  dom <- evalTyM (MTyVar mdom)
+  dom <- evalTy (MTyVar mdom)
   z <- fresh (s2n "z")
-  bcod <- local (bindEnv z (V.Var z)) do
+  bcod <- bindVar [(z, V.Var z)] do
     mcod <- freshAnonMeta
-    evalTyM (MTyVar mcod)
+    evalTy (MTyVar mcod)
   cod <- closeTyM z (Thunk bcod)
-  unify [Right (Thunk ty,
+  unify' [Right (Thunk ty,
     Thunk $ (if b then V.Pi else V.Sigma) (Thunk dom) cod)]
   return (dom, cod)
 
@@ -359,7 +314,7 @@ expectPiSigma b ty = do
 convSp :: Tyck m => [Spine] -> [Spine] -> m [Equation]
 convSp [] [] = return []
 convSp (sp0:sp) (sp0':sp') = (++) <$> convSp sp sp' <*> case (sp0, sp0') of
-  (V.App th, V.App th') -> return [Left (th, th')]
+  (V.App th, V.App th') -> withCtx [Left (th, th')]
   (V.Fst, V.Fst) -> return []
   (V.Snd, V.Snd) -> return []
   (V.NatElim _ z s, V.NatElim _ z' s') -> do
@@ -371,7 +326,8 @@ convSp (sp0:sp) (sp0':sp') = (++) <$> convSp sp sp' <*> case (sp0, sp0') of
     ((m, k), vs) <- s $$+ \(m, k) -> [(m, V.Var m), (k, V.Var k)]
     vs' <- s' $$ \(m', k') -> [(m', V.Var m), (k', V.Var k)]
 
-    return [Left (Thunk vz, Thunk vz'), Left (Thunk vs, Thunk vs')]
+    withCtx [Left (Thunk vz, Thunk vz'), Left (Thunk vs, Thunk vs')]
+  -- todo other spine
   p -> throwError $ "Not convertible: " ++ show p
 convSp p q = throwError $ "Not convertible: " ++ show p ++ show q
 
@@ -387,7 +343,7 @@ conv (V.Con (Const name arg) sp _) (V.Con (Const name' arg') sp' _) =
   if name /= name' then
     throwError $ "Not convertible: " ++ name ++ " /= " ++ name'
   else do
-    let eq_arg = zipWith (curry Left) arg arg'
+    eq_arg <- withCtx $ zipWith (curry Left) arg arg'
     sp_arg <- convSp sp sp'
     return $ Just (eq_arg ++ sp_arg)
 -- rigid-flex and flex-rigid
@@ -403,28 +359,28 @@ conv (V.Lam f) (V.Lam g) = do
   -- so we use this slighly cursed leaking implementation
   (x, s) <- f $$+ \x -> [(x, V.Var x)]
   t <- g $$ \y -> [(y, V.Var x)]
-  s' <- forceM (Thunk s)
-  t' <- forceM (Thunk t)
+  s' <- force (Thunk s)
+  t' <- force (Thunk t)
   conv s' t'
 conv (V.Lam f) g = do
   (x, s) <- f $$+ \x -> [(x, V.Var x)]
   t <- vApp g (V.Var x)
-  s' <- forceM (Thunk s)
-  t' <- forceM (Thunk t)
+  s' <- force (Thunk s)
+  t' <- force (Thunk t)
   conv s' t'
 conv g f@V.Lam {} = conv f g
 
 conv (V.Pair ths1 tht1) (V.Pair ths2 tht2) =
-  return $ Just [Left (ths1, ths2), Left (tht1, tht2)]
+  Just <$> withCtx [Left (ths1, ths2), Left (tht1, tht2)]
 conv (V.Pair ths tht) m =
-  return $ Just [Left (ths, Thunk (vFst m)), Left (tht, Thunk (vSnd m))]
+  Just <$> withCtx [Left (ths, Thunk (vFst m)), Left (tht, Thunk (vSnd m))]
 conv m n@V.Pair {} = conv n m
 
 conv V.Zero V.Zero = return (Just [])
 conv (V.Suc n th) (V.Suc m th') =
   if n == m then do
-    t <- forceM th
-    t' <- forceM th'
+    t <- force th
+    t' <- force th'
     conv t t'
   else
     throwError $ show n ++ " /= " ++ show m
@@ -432,11 +388,11 @@ conv (V.Suc n th) (V.Suc m th') =
 -- todo Lock, InCof
 
 conv (V.Quote th1) (V.Quote th2) = do
-  ty1 <- forceTyM th1
-  ty2 <- forceTyM th2
+  ty1 <- forceTy th1
+  ty2 <- forceTy th2
   convTy ty1 ty2
 conv (V.Quote th) tm = do
-  ty <- forceTyM th
+  ty <- forceTy th
   convTy ty (V.vEl tm)
 conv tm tm'@V.Quote {} = conv tm' tm
 
@@ -451,10 +407,18 @@ convTy t t'@V.MTyVar {} = convTy t' t
 convTy (V.Sigma ty c) (V.Sigma ty' c') = do
   (x, s) <- c $$:+ \x -> [(x, V.Var x)]
   t <- c' $$: \y -> [(y, V.Var x)]
-  return $ Just [Right (ty, ty'), Right (Thunk s, Thunk t)]
+  Just <$> withCtx [Right (ty, ty'), Right (Thunk s, Thunk t)]
 convTy (V.Pi ty c) (V.Pi ty' c') -- small hack to reduce repeat
   = convTy (V.Sigma ty c) (V.Sigma ty' c')
 convTy V.Nat V.Nat = return (Just [])
+convTy (V.Ext ty p tm) (V.Ext ty' p' tm') =
+  if p /= p' then
+    throwError $ "Not convertible: " ++ show p ++ " /= " ++ show p'
+  else do
+    q <- asks cofEnv
+    v <- tm $$? p
+    v' <- tm' $$? p'
+    return $ Just [(q, Right (ty, ty')), (p <> q, Left (Thunk v, Thunk v'))]
 convTy V.Universe V.Universe = return (Just [])
 convTy (V.El t1) (V.El t2) = conv t1 t2
 -- This is needed because V.El is special
@@ -467,7 +431,7 @@ convTy p q = throwError $ "Not convertible: " ++ show p ++ " /= " ++ show q
 solve :: Tyck m => MetaVar (Thunk Val) -> [Spine] -> Val -> m Bool
 solve (MetaVar _ mid subs) sp v = do
   vsp <- mapM spine sp
-  vsubs <- mapM forceM subs
+  vsubs <- mapM force subs
   let vars' = sequence (map toVar vsubs ++ map (toVar =<<) vsp)
   case vars' of
     Nothing -> return False
@@ -479,13 +443,13 @@ solve (MetaVar _ mid subs) sp v = do
     else
       return False
   where
-    spine :: (MonadReader Context m, MonadMEnv m) => Spine -> m (Maybe Val)
-    spine (V.App s) = Just <$> forceM s
+    spine :: Tyck m => Spine -> m (Maybe Val)
+    spine (V.App s) = Just <$> force s
     spine _ = return Nothing
 
 solveTy :: Tyck m => MetaVar (Thunk Val) -> TyVal -> m Bool
 solveTy (MetaVar _ mid subs) v = do
-  vsubs <- mapM forceM subs
+  vsubs <- mapM force subs
   let rvars' = mapM toVar vsubs
   case rvars' of
     Nothing -> return False
@@ -502,14 +466,24 @@ solveTy (MetaVar _ mid subs) v = do
 -- splits into zero or more smaller equations, without recursively solving
 -- (unless it's straightforward to do so)
 attempt :: Tyck m => Equation -> m (Maybe [Equation])
-attempt (Left (th1, th2)) = do
-  t1 <- forceM th1
-  t2 <- forceM th2
+attempt (c, Left (th1, th2)) = withContext emptyEnv c do
+  t1 <- force th1
+  t2 <- force th2
   conv t1 t2
-attempt (Right (th1, th2)) = do
-  t1 <- forceTyM th1
-  t2 <- forceTyM th2
+attempt (c, Right (th1, th2)) = withContext emptyEnv c do
+  t1 <- forceTy th1
+  t2 <- forceTy th2
   convTy t1 t2
+
+-- Adds the equations under current context
+withCtx :: Tyck m => [a] -> m [(Cof, a)]
+withCtx eqs = do
+  ctx <- ask
+  return $ map (\eq -> (cofEnv ctx, eq)) eqs
+
+unify' :: Tyck m =>
+  [Either (Thunk Val, Thunk Val) (Thunk TyVal, Thunk TyVal)] -> m ()
+unify' eqs = unify =<< withCtx eqs
 
 -- The postponing logic
 unify :: Tyck m => [Equation] -> m ()
@@ -518,32 +492,36 @@ unify (eq:eqs) = do
   result <- attempt eq
   case result of
     Just eqs' -> do
-      menv <- get
-      put menv {
-        equations = []  -- todo filter only the relevant ones
+      st <- get
+      put st {
+        metas = (metas st) {
+          equations = []
+        } -- todo filter only the relevant ones
       }
-      unify (eqs' ++ eqs ++ equations menv)
+      unify (eqs' ++ eqs ++ equations (metas st))
     Nothing -> do
       -- ? use snoc list
-      modify \menv -> menv { equations = eq : equations menv }
+      modify \st -> st {
+        metas = (metas st) { equations = eq : equations (metas st) }
+      }
       unify eqs
 
 -- Substitute in the metas given a term, without normalizing first
 zonkMeta :: Tyck m => Closure [Var] Term -> [Term] -> m Term
 zonkMeta sol subs = do
-  vsubs <- mapM evalM subs
+  vsubs <- mapM eval subs
   val <- sol $$ (`zip'` vsubs)
-  zonk =<< reifyM val
+  zonk =<< reify val
 
 zonkMetaTy :: Tyck m => Closure [Var] Type -> [Term] -> m Type
 zonkMetaTy sol subs = do
-  vsubs <- mapM evalM subs
+  vsubs <- mapM eval subs
   val <- sol $$: (`zip'` vsubs)
-  zonkTy =<< reifyTyM val
+  zonkTy =<< reifyTy val
 
 zonk :: Tyck m => Term -> m Term
 zonk (MVar (MetaVar name mid subs)) = do
-  sol <- gets (IM.lookup mid . termSol)
+  sol <- gets (IM.lookup mid . termSol . metas)
   case sol of
     Just s -> zonkMeta s subs
     Nothing -> MVar . MetaVar name mid <$> mapM zonk subs
@@ -551,7 +529,7 @@ zonk (Var v) = return $ Var v
 zonk (Con (Const name subs)) = Con . Const name <$> mapM zonk subs
 zonk (Lam f) = do
   (x, f') <- unbind f
-  zf <- local (bindEnv x (V.Var x)) $ zonk f'
+  zf <- bindVar [(x, V.Var x)] $ zonk f'
   return $ Lam $ bind x zf
 zonk (App s t) = App <$> zonk s <*> zonk t
 zonk (Pair s t) = Pair <$> zonk s <*> zonk t
@@ -561,10 +539,10 @@ zonk Zero = return Zero
 zonk (Suc s) = Suc <$> zonk s
 zonk (NatElim m z s c) = do
   (x, m') <- unbind m
-  zm <- local (bindEnv x (V.Var x)) $ zonkTy m'
+  zm <- bindVar [(x, V.Var x)] $ zonkTy m'
   zz <- zonk z
   ((n, r), s') <- unbind s
-  zs <- local (bindEnv n (V.Var n) . bindEnv r (V.Var r)) $ zonk s'
+  zs <- bindVar [(n, V.Var n), (r, V.Var r)] $ zonk s'
   zc <- zonk c
   return $ NatElim (bind x zm) zz (bind (n, r) zs) zc
 zonk (Lock p tm) = Lock p <$> zonk tm
@@ -576,19 +554,19 @@ zonk (The ty tm) = The <$> zonkTy ty <*> zonk tm
 
 zonkTy :: Tyck m => Type -> m Type
 zonkTy m@(MTyVar (MetaVar _ mid subs)) = do
-  sol <- gets (IM.lookup mid . typeSol)
+  sol <- gets (IM.lookup mid . typeSol . metas)
   case sol of
     Just s -> zonkMetaTy s subs
     Nothing -> return m
 zonkTy (Sigma ty f) = do
   zty <- zonkTy ty
   (x, f') <- unbind f
-  zf <- local (bindEnv x (V.Var x)) $ zonkTy f'
+  zf <- bindVar [(x, V.Var x)] $ zonkTy f'
   return $ Sigma zty $ bind x zf
 zonkTy (Pi ty f) = do
   zty <- zonkTy ty
   (x, f') <- unbind f
-  zf <- local (bindEnv x (V.Var x)) $ zonkTy f'
+  zf <- bindVar [(x, V.Var x)] $ zonkTy f'
   return $ Pi zty $ bind x zf
 zonkTy Nat = return Nat
 zonkTy (Pushforward p ty) = Pushforward p <$> zonkTy ty
@@ -597,32 +575,39 @@ zonkTy Universe = return Universe
 zonkTy (El tm) = El <$> zonk tm
 
 ---- Processing whole files ----
-processFile :: Tyck m => [(R.Judgment, String)] -> Raw -> m (Type, Term, Term)
+processFile :: Tyck m =>
+  [(R.Judgment, [String], String)] -> Raw -> m (Type, Term, Term)
 processFile [] expr = do
   (tm, vty) <- infer expr
-  vtm <- evalM tm
+  vtm <- eval tm
   ztm <- zonk tm
   -- You probably need to force whenever metas could be solved
-  ty <- reifyTyM =<< forceTyM vty
-  ntm <- reifyM =<< forceM (Thunk vtm)
+  ty <- reifyTy =<< forceTy vty
+  ntm <- reify =<< force (Thunk vtm)
   return (ty, ztm, ntm)
-processFile ((rj,name):decl) expr = do
-  j <- checkJudgment rj
-  local (declareConst name j) $ processFile decl expr
+processFile ((rj,unfolding,name):decl) expr = do
+  -- calculate the unfoldings and work locally
+  _
+  j <- checkJudgment unfolding rj
+  -- declare two constants, one directly from j, the other
+  -- wrapped in an extension type
+  _
+  processFile decl expr
   -- todo freeze metas
 
 ----- Example monad to use functions ----
-type TyckM = StateT MetaEnv (ReaderT Context (ExceptT String FreshM))
-instance MonadMEnv TyckM
+newtype TyckM a = TyckM {
+  runTyckM :: StateT Decls (ReaderT Context (ExceptT String FreshM)) a
+} deriving (
+  Functor, Applicative, Monad,
+  Fresh, MonadError String, MonadReader Context, MonadState Decls)
 instance Tyck TyckM
-runTyckM :: TyckM a -> Either String (a, MetaEnv)
-runTyckM m = runFreshM $
+
+execTyckM :: TyckM a -> Either String (a, Decls)
+execTyckM m = runFreshM $
   runExceptT $
-  runReaderT (runStateT m emptyMetaEnv)
+  runReaderT (runStateT (runTyckM m) emptyDecls)
     emptyContext
 
 evalTyckM :: TyckM a -> Either String a
-evalTyckM m = runFreshM $
-  runExceptT $
-  runReaderT (evalStateT m emptyMetaEnv)
-    emptyContext
+evalTyckM m = fst <$> execTyckM m
