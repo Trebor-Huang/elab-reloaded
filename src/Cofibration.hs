@@ -22,13 +22,12 @@ instance Show Atom where
   show (Atom p _) = p
 
 data World = World {
-  atoms :: IM.IntMap String,
   relations :: IM.IntMap Cof,
   nextAtom :: !Int
 } deriving Show
 
 emptyWorld :: World
-emptyWorld = World IM.empty IM.empty 0
+emptyWorld = World IM.empty 0
 
 newAtom :: String -> Cof -> World -> (Atom, World)
 newAtom name p w =
@@ -36,7 +35,6 @@ newAtom name p w =
     i = nextAtom w
     a = Atom name i in
     (a, w {
-      atoms = IM.insert i name (atoms w),
       relations = IM.insert i p (relations w),
       nextAtom = i + 1
     })
