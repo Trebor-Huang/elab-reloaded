@@ -31,6 +31,7 @@ import qualified Syntax as S
 import qualified Raw as R
 import Cofibration
 import Utils
+import Debug.Trace (trace)
 
 -- Environment
 type Env = M.Map S.Var Val  -- a substitution
@@ -370,7 +371,7 @@ force :: Tyck m => Thunk Val -> m Val
 force (Thunk m@(Flex (S.MetaVar _ mid subs) sp st)) = do
   sol <- gets (IM.lookup mid . termSol . metas)
   case sol of
-    Just b -> vSpine sp =<< b $$ (`zip'` map unthunk subs)
+    Just b -> force . Thunk =<< vSpine sp =<< b $$ (`zip'` map unthunk subs)
     Nothing -> do
       res <- selectCases st
       case res of
@@ -382,7 +383,8 @@ force (Thunk m@(Rigid _ _ st)) = do
     Just x -> force x
     Nothing -> return m
 force (Thunk m@(Con _ _ st)) = do
-  res <- selectCases st
+  ce <- asks cofEnv
+  res <- trace ("force @ " ++ show ce ++ " >> " ++ show m) $ selectCases st
   case res of
     Just x -> force x
     Nothing -> return m
@@ -392,7 +394,7 @@ forceTy :: Tyck m => Thunk TyVal -> m TyVal
 forceTy (Thunk m@(MTyVar (S.MetaVar _ mid subs) st)) = do
   sol <- gets (IM.lookup mid . typeSol . metas)
   case sol of
-    Just b -> b $$: (`zip'` map unthunk subs)
+    Just b -> forceTy . Thunk =<< b $$: (`zip'` map unthunk subs)
     Nothing -> do
       res <- selectCases st
       case res of

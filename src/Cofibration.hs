@@ -5,6 +5,7 @@ module Cofibration (
   Cases, pattern EmptyCases, pattern SingleCase, select) where
 import qualified Data.IntMap as IM
 import qualified Data.IntSet as IS
+import Data.List (intercalate)
 import GHC.Generics (Generic)
 import Unbound.Generics.LocallyNameless
 
@@ -41,7 +42,12 @@ newAtom name p w =
     })
 
 newtype Cof = Cof (Ignore (IM.IntMap String)) -- a list for conjunctions
-  deriving (Generic, Show)
+  deriving (Generic)
+instance Show Cof where
+  show (Cof p) = "⟨" ++
+    intercalate " ∧ " (map snd $ IM.toList (unignore p))
+    ++ "⟩"
+
 instance Alpha Cof
 instance Subst a Cof
 
@@ -68,7 +74,8 @@ implies w (Cof p) (Cof q) = let
   Cof impls = mconcat $
     map (\k -> IM.findWithDefault mempty k $ relations w) $
     IM.keys $ unignore p
-  in IM.keysSet (unignore q) `IS.isSubsetOf` IM.keysSet (unignore impls)
+  in IM.keysSet (unignore q) `IS.isSubsetOf`
+    (IM.keysSet (unignore impls) `IS.union` IM.keysSet (unignore p))
 
 newtype Cases a = Cases [(Cof, a)]
   deriving (Functor, Foldable, Traversable, Semigroup, Monoid, Show)

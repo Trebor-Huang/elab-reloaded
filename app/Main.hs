@@ -7,7 +7,7 @@ import TypeCheck
 
 main :: IO ()
 main = do
-  src <- readFile "./test/test.tt"
+  src <- readFile "./test/test-flip.tt"
   putStrLn "Read file."
   (decl, expr) <- parseString src
   putStrLn "Parsed file."

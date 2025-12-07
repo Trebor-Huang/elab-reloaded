@@ -39,10 +39,10 @@ freshAnonMeta = do
     ("?" ++ show ix) ix (map (Var . coerce . fst) vs)
 
 insertTermSol :: Tyck m => Int -> Closure [Var] Term -> m ()
-insertTermSol i s = trace (show i ++ " == " ++ show s) do
+insertTermSol i s = do
   st <- get
   let newGraph = insertNode (graph (metas st)) i (IS.toList $ getClosureMetas getMetas s)
-  trace (show newGraph) if hasCycle newGraph then
+  if hasCycle newGraph then
     throwError "Occurs check"
   else
     put st {
@@ -54,10 +54,10 @@ insertTermSol i s = trace (show i ++ " == " ++ show s) do
     }
 
 insertTypeSol :: Tyck m => Int -> Closure [Var] Type -> m ()
-insertTypeSol i s = trace (show i ++ " == " ++ show s) do
+insertTypeSol i s = do
   st <- get
   let newGraph = insertNode (graph (metas st)) i (IS.toList $ getClosureMetas getTyMetas s)
-  trace (show newGraph) if hasCycle newGraph then
+  if hasCycle newGraph then
     throwError "Occurs check"
   else
     put st {
@@ -77,7 +77,7 @@ closeM a th = do
 closeTyM :: (Tyck m, Alpha a) => a -> Thunk TyVal -> m (Closure a Type)
 closeTyM a th = do
   t <- forceTy th
-  ty <- reifyTy  t
+  ty <- reifyTy t
   closeB (bind a ty)
 
 ---- Bidirectional type checking ----
@@ -508,10 +508,12 @@ solveTy (MetaVar _ mid subs) v = do
 -- splits into zero or more smaller equations, without recursively solving
 -- (unless it's straightforward to do so)
 attempt :: Tyck m => Equation -> m (Maybe [Equation])
-attempt (e, c, Left (th1, th2)) = withContext e c do
+attempt (e, c, Left (th1, th2)) = trace
+  ("Attempting with " ++ show c ++ " to solve " ++ show th1 ++ " =? " ++ show th2)
+  $ withContext e c do
   t1 <- force th1
   t2 <- force th2
-  conv t1 t2
+  trace ("Forcing results: " ++ show t1 ++ " =? " ++ show t2) $ conv t1 t2
 attempt (e, c, Right (th1, th2)) = withContext e c do
   t1 <- forceTy th1
   t2 <- forceTy th2
@@ -634,7 +636,7 @@ processFile [] expr = trace ("Evaluating: " ++ show expr) do
   ntm <- reify =<< force (Thunk vtm)
   return (ty, ztm, ntm)
 processFile (R.TopLevel rj unfolding name:decl) expr =
-  trace ("Defining " ++ name) do
+  trace ("Defining " ++ name ++ " " ++ show unfolding) do
   -- calculate the unfoldings and work locally
   cof <- calculateUnfolds unfolding
   result <- checkJudgment cof name rj

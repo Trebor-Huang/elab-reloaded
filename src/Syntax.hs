@@ -96,10 +96,10 @@ showTermM i = \case
   -- todo hide these constructors
   InCof p t -> do
     s <- showTermM 0 t
-    return $ showParen (i > 0) (showString "In⟨" . shows p . showString "⟩ " . s)
+    return $ showParen (i > 0) (showString "In" . shows p . showString " " . s)
   OutCof p _ t -> do -- todo show the restriction
     s <- showTermM 0 t
-    return $ showParen (i > 0) (showString "Out⟨" . shows p . showString "⟩ " . s)
+    return $ showParen (i > 0) (showString "Out" . shows p . showString " " . s)
 
   Quote t -> showTypeM i t
   The ty tm -> do
