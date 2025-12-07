@@ -12,7 +12,6 @@ import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import qualified Data.IntSet as IS
 import Data.Coerce (coerce)
-import Debug.Trace (trace)
 
 import qualified Raw as R
 import Raw (Raw)
@@ -499,15 +498,11 @@ solveTy (MetaVar _ mid subs) v = do
 -- splits into zero or more smaller equations, without recursively solving
 -- (unless it's straightforward to do so)
 attempt :: Tyck m => Equation -> m (Maybe [Equation])
-attempt (e, c, Left (th1, th2)) = trace
-  ("Attempting with " ++ show c ++ " to solve " ++ show th1 ++ " =? " ++ show th2)
-  $ withContext e c do
+attempt (e, c, Left (th1, th2)) = withContext e c do
   t1 <- force th1
   t2 <- force th2
   conv t1 t2
-attempt (e, c, Right (th1, th2)) = trace
-  ("Attempting with " ++ show c ++ " to solve " ++ show th1 ++ " =:? " ++ show th2)
-  $ withContext e c do
+attempt (e, c, Right (th1, th2)) = withContext e c do
   t1 <- forceTy th1
   t2 <- forceTy th2
   convTy t1 t2
@@ -627,8 +622,7 @@ processFile [] expr = bindCof unfoldAll do
   ty <- reifyTy =<< forceTy vty
   ntm <- reify =<< force (Thunk vtm)
   return (ty, ztm, ntm)
-processFile (R.TopLevel rj unfolding name:decl) expr =
-  trace ("Defining " ++ name ++ " " ++ show unfolding) do
+processFile (R.TopLevel rj unfolding name:decl) expr = do
   -- calculate the unfoldings and work locally
   cof <- calculateUnfolds unfolding
   result <- checkJudgment cof name rj
