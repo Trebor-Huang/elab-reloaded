@@ -31,7 +31,6 @@ import qualified Syntax as S
 import qualified Raw as R
 import Cofibration
 import Utils
-import Debug.Trace (trace)
 
 -- Environment
 type Env = M.Map S.Var Val  -- a substitution
@@ -383,8 +382,7 @@ force (Thunk m@(Rigid _ _ st)) = do
     Just x -> force x
     Nothing -> return m
 force (Thunk m@(Con _ _ st)) = do
-  ce <- asks cofEnv
-  res <- trace ("force @ " ++ show ce ++ " >> " ++ show m) $ selectCases st
+  res <- selectCases st
   case res of
     Just x -> force x
     Nothing -> return m

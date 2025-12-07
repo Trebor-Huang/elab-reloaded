@@ -2,4 +2,12 @@ define
   A : U ; B : U |- flip : (A * B) -> (B * A)
     = \p. pair(snd(p), fst(p))
 
-eval flip(Nat, Nat)
+define
+  A : U ; n : Nat |- repeat : (A -> A) -> (A -> A)
+    = \f. elim(_._,
+      {- zero -} \x. x,
+      {- suc -} n r. \x. f (r x),
+      n
+    )
+
+eval repeat(_, 3) flip(Nat, Nat)

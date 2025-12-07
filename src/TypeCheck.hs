@@ -108,11 +108,10 @@ check (R.InCof p _) (V.Ext _ q _)
   | p /= q = throwError "Cofibration mismatch"
   | otherwise = error "todo"
 
-check tm ty = trace ("Trying to infer the type of "++show tm) do
+check tm ty = do
   (tm', thty') <- infer tm
-  trace ("Infer success: " ++ show tm') do
-    unify' [Right (Thunk ty, thty')]
-    return tm'
+  unify' [Right (Thunk ty, thty')]
+  return tm'
 
 checkTy :: Tyck m => Raw -> m Type
 checkTy (R.Pi rdom rc) = do
@@ -154,7 +153,7 @@ checkJudgment p name (R.Definition u rty rtm) = do
     Opaque -> freshCof name p
     Controlled -> freshCof name p
     Transparent -> return p
-  vs <- asks rvars
+  vs <- asks (reverse . rvars)
   return $ JDefinition (unignore u == Opaque) cof
     (Definition ty tm) -- the definition
     (Postulate (Ext ty cof (Con
@@ -209,7 +208,7 @@ infer (R.Con name args) = do
     -- this is a true postulate
     Nothing -> infer (R.Con' name args)
     -- this is a definition
-    Just (_, cof) -> trace ("Inferring user constant " ++ name) $ infer
+    Just (_, cof) -> infer
       (R.OutCof cof
         (R.Con' (internalName name) args)
         (R.Con' name args))
@@ -314,7 +313,7 @@ infer R.Nat = return (Quote Nat, Thunk V.Universe)
 
 infer (R.InCof _ _) = error "todo"
 
-infer t@(R.OutCof p rres rterm) = trace ("Inferring " ++ show t) do
+infer (R.OutCof p rres rterm) = do
   (tres, vtyres) <- bindCof p $ infer rres
   cres <- closeB (bind () tres)
   mty <- freshAnonMeta
@@ -492,8 +491,8 @@ solve (MetaVar _ mid subs) sp v = do
 solveTy :: Tyck m => MetaVar (Thunk Val) -> TyVal -> m Bool
 solveTy (MetaVar _ mid subs) v = do
   vsubs <- mapM force subs
-  let rvars' = mapM toVar vsubs
-  case rvars' of
+  let vars' = mapM toVar vsubs
+  case vars' of
     Nothing -> return False
     Just vars -> if allUnique vars then do
       -- todo this causes a tiny of rechecking
@@ -513,8 +512,10 @@ attempt (e, c, Left (th1, th2)) = trace
   $ withContext e c do
   t1 <- force th1
   t2 <- force th2
-  trace ("Forcing results: " ++ show t1 ++ " =? " ++ show t2) $ conv t1 t2
-attempt (e, c, Right (th1, th2)) = withContext e c do
+  conv t1 t2
+attempt (e, c, Right (th1, th2)) = trace
+  ("Attempting with " ++ show c ++ " to solve " ++ show th1 ++ " =:? " ++ show th2)
+  $ withContext e c do
   t1 <- forceTy th1
   t2 <- forceTy th2
   convTy t1 t2
