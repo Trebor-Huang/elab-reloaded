@@ -104,9 +104,7 @@ check (R.Pair s1 s2) (V.Sigma th1 t2) = do
 check R.Zero V.Nat = return Zero
 check (R.Suc t) V.Nat = Suc <$> check t V.Nat
 
-check (R.InCof p _) (V.Ext _ q _)
-  | p /= q = throwError "Cofibration mismatch"
-  | otherwise = error "todo"
+-- incof
 
 check tm ty = do
   (tm', thty') <- infer tm
@@ -311,7 +309,7 @@ infer (R.NatElim rmc rz rsc rarg) = do
 infer R.Nat = return (Quote Nat, Thunk V.Universe)
   -- since it's just one step we can inline it
 
-infer (R.InCof _ _) = error "todo"
+-- incof
 
 infer (R.OutCof p rres rterm) = do
   (tres, vtyres) <- bindCof p $ infer rres
@@ -416,13 +414,7 @@ conv (V.Suc n th) (V.Suc m th') =
   else
     throwError $ show n ++ " /= " ++ show m
 
-conv (V.InCof p1 th1) (V.InCof p2 th2) =
-  if p1 == p2 then bindCof p1 do
-    t1 <- force th1
-    t2 <- force th2
-    conv t1 t2
-  else
-    throwError $ show p1 ++ " /= " ++ show p2
+-- incof
 
 conv (V.Quote th1) (V.Quote th2) = do
   ty1 <- forceTy th1
@@ -590,7 +582,6 @@ zonk (NatElim m z s c) = do
   zs <- bindVar [(n, V.Var n), (r, V.Var r)] $ zonk s'
   zc <- zonk c
   return $ NatElim (bind x zm) zz (bind (n, r) zs) zc
-zonk (InCof p tm) = InCof p <$> zonk tm
 zonk (OutCof p t1 t2) = OutCof p <$> zonk t1 <*> zonk t2
 zonk (Quote ty) = Quote <$> zonkTy ty
 zonk (The ty tm) = The <$> zonkTy ty <*> zonk tm
@@ -628,7 +619,7 @@ calculateUnfolds ns = do
       Nothing -> error $ "calculateUnfolds: unknown constant " ++ v
 
 processFile :: Tyck m => [R.TopLevel] -> Raw -> m (Type, Term, Term)
-processFile [] expr = trace ("Evaluating: " ++ show expr) do
+processFile [] expr = bindCof unfoldAll do
   (tm, vty) <- infer expr
   vtm <- eval tm
   ztm <- zonk tm

@@ -183,7 +183,6 @@ data Val
   | Lam (Closure S.Var S.Term)
   | Pair (Thunk Val) (Thunk Val)
   | Zero | Suc Int (Thunk Val)
-  | InCof Cof (Thunk Val)
   | Quote (Thunk TyVal)
   deriving Show
 
@@ -200,7 +199,6 @@ getMetas (Pair (Thunk a) (Thunk b)) =
   getMetas a `IS.union` getMetas b
 getMetas Zero = IS.empty
 getMetas (Suc _ (Thunk v)) = getMetas v
-getMetas (InCof _ (Thunk v)) = getMetas v
 getMetas (Quote (Thunk v)) = getTyMetas v
 
 data TyVal
@@ -305,7 +303,7 @@ vApp fun arg = case fun of
 thApp arg fun = Thunk <$> vApp (unthunk fun) arg
 
 vOutCof :: Cof -> Thunk Val -> Val -> Val
-vOutCof _ _ (InCof _ t) = unthunk t
+-- vOutCof _ _ (InCof _ t) = unthunk t
 vOutCof p u (Flex mv sp st)
   = Flex mv (OutCof p u:sp) $ SingleCase p u <> (thOutCof p u <$> st)
 vOutCof p u (Rigid v sp st)
@@ -435,9 +433,6 @@ eval = \case
     v <- eval t
     vNatElim cm cz cs v
 
-  S.InCof p t -> do
-    v <- eval t
-    return $ InCof p (Thunk v)
   S.OutCof p u t -> do
     vu <- eval u
     vt <- eval t
@@ -532,8 +527,6 @@ reify (Pair th1 th2) = do
 
 reify Zero = return S.Zero
 reify (Suc k th) = nTimes k S.Suc <$> (reify =<< force th)
-
-reify (InCof p th) = S.InCof p <$> (reify =<< force th)
 
 reify (Quote thty) = S.Quote <$> (reifyTy =<< forceTy thty)
 

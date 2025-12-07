@@ -1,7 +1,7 @@
 module Cofibration (
   Atom,
   World, emptyWorld, newAtom,
-  Cof, implies, fromAtom,
+  Cof, implies, fromAtom, unfoldAll,
   Cases, pattern EmptyCases, pattern SingleCase, select) where
 import qualified Data.IntMap as IM
 import qualified Data.IntSet as IS
@@ -68,14 +68,18 @@ instance Monoid Cof where
 fromAtom :: Atom -> Cof
 fromAtom (Atom s i) = Cof (ignore $ IM.singleton i s)
 
+unfoldAll :: Cof  -- represents the false proposition
+unfoldAll = fromAtom (Atom "_unfoldAll" (-1))
+
 --         W     ;  Phi |- Psi true
 implies :: World -> Cof -> Cof -> Bool
 implies w (Cof p) (Cof q) = let
   Cof impls = mconcat $
     map (\k -> IM.findWithDefault mempty k $ relations w) $
     IM.keys $ unignore p
-  in IM.keysSet (unignore q) `IS.isSubsetOf`
-    (IM.keysSet (unignore impls) `IS.union` IM.keysSet (unignore p))
+  impSet = IM.keysSet (unignore impls) `IS.union` IM.keysSet (unignore p)
+  in
+    ((-1) `IS.member` impSet) || (IM.keysSet (unignore q) `IS.isSubsetOf` impSet)
 
 newtype Cases a = Cases [(Cof, a)]
   deriving (Functor, Foldable, Traversable, Semigroup, Monoid, Show)

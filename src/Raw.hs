@@ -33,7 +33,7 @@ data Raw
     {- suc -} (Bind (Var, Var) Raw)
     {- arg -} Raw
   | Nat
-  | InCof Cof Raw | OutCof Cof Raw Raw  -- internal use
+  | OutCof Cof Raw Raw  -- internal use
   | Universe -- implicit Coquand universe
   | The Raw Raw
   | Hole

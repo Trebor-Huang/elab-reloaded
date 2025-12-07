@@ -36,7 +36,7 @@ data Term
     {- suc -} (Bind (Var, Var) Term)
     {- arg -} Term
   -- Extension type
-  | InCof Cof Term | OutCof Cof {- restrict -} Term {- actual -} Term
+  | OutCof Cof {- restrict -} Term {- actual -} Term
   -- universe type
   | Quote Type
   -- type ascription
@@ -94,9 +94,6 @@ showTermM i = \case
       showParen True (sm . sz . showString ", " . ss . st)
 
   -- todo hide these constructors
-  InCof p t -> do
-    s <- showTermM 0 t
-    return $ showParen (i > 0) (showString "In" . shows p . showString " " . s)
   OutCof p _ t -> do -- todo show the restriction
     s <- showTermM 0 t
     return $ showParen (i > 0) (showString "Out" . shows p . showString " " . s)
@@ -192,7 +189,6 @@ getMetas (NatElim b1 t1 b2 t2) =
   getMetas t1 `IS.union`
   getMetas (snd $ unsafeUnbind b2) `IS.union`
   getMetas t2
-getMetas (InCof _ t) = getMetas t
 getMetas (OutCof _ t s) = getMetas t `IS.union` getMetas s
 getMetas (Quote ty) = getTyMetas ty
 getMetas (The ty tm) = getTyMetas ty `IS.union` getMetas tm
